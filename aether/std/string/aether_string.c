@@ -1,0 +1,687 @@
+#include "aether_string.h"
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdarg.h>
+#include <ctype.h>
+#include <errno.h>
+#include <limits.h>
+#include <stdint.h>  // SIZE_MAX (not in <limits.h> on MinGW)
+
+// Helper: get data pointer and length from either AetherString* or plain char*
+static inline const char* str_data(const void* s) {
+    if (!s) return "";
+    if (is_aether_string(s)) return ((const AetherString*)s)->data;
+    return (const char*)s;
+}
+
+static inline size_t str_len(const void* s) {
+    if (!s) return 0;
+    if (is_aether_string(s)) return ((const AetherString*)s)->length;
+    return strlen((const char*)s);
+}
+
+// Alias for string literal creation
+AetherString* string_from_literal(const char* cstr) {
+    return string_new(cstr);
+}
+
+// Alias for from_cstr
+AetherString* string_from_cstr(const char* cstr) {
+    return string_new(cstr);
+}
+
+// Alias for free
+void string_free(const void* str) {
+    string_release(str);
+}
+
+// String creation
+AetherString* string_new(const char* cstr) {
+    if (!cstr) return string_empty();
+    return string_new_with_length(cstr, strlen(cstr));
+}
+
+AetherString* string_new_with_length(const char* data, size_t length) {
+    AetherString* str = (AetherString*)malloc(sizeof(AetherString));
+    if (!str) return NULL;
+    char* buf = (char*)malloc(length + 1);
+    if (!buf) { free(str); return NULL; }
+    str->magic = AETHER_STRING_MAGIC;
+    str->length = length;
+    str->capacity = length + 1;
+    str->data = buf;
+    if (data && length) memcpy(buf, data, length);
+    buf[length] = '\0';
+    str->ref_count = 1;
+    return str;
+}
+
+AetherString* string_empty() {
+    return string_new_with_length("", 0);
+}
+
+// Reference counting — safe to call with plain char* (no-op)
+void string_retain(const void* str) {
+    if (str && is_aether_string(str)) ((AetherString*)str)->ref_count++;
+}
+
+void string_release(const void* str) {
+    if (!str || !is_aether_string(str)) return;
+    AetherString* s = (AetherString*)str;
+    s->ref_count--;
+    if (s->ref_count <= 0) {
+        free(s->data);
+        free(s);
+    }
+}
+
+// String operations
+// Returns plain char* — usable directly with print/interpolation.
+// Caller owns the memory (free with free() or string_release()).
+char* string_concat(const void* a, const void* b) {
+    if (!a || !b) return NULL;
+    size_t la = str_len(a), lb = str_len(b);
+    const char* da = str_data(a);
+    const char* db = str_data(b);
+
+    // Fast paths for empty inputs — avoid the full concat work when one
+    // side is empty (common in loops that accumulate with an empty seed,
+    // or when interpolating with optional fragments).
+    if (lb == 0) {
+        char* out = (char*)malloc(la + 1);
+        if (!out) return NULL;
+        if (la) memcpy(out, da, la);
+        out[la] = '\0';
+        return out;
+    }
+    if (la == 0) {
+        char* out = (char*)malloc(lb + 1);
+        if (!out) return NULL;
+        memcpy(out, db, lb);
+        out[lb] = '\0';
+        return out;
+    }
+
+    // Guard against size_t overflow on pathological inputs before
+    // adding 1 for the null terminator.
+    if (la > SIZE_MAX - lb - 1) return NULL;
+    size_t new_length = la + lb;
+    char* new_data = (char*)malloc(new_length + 1);
+    if (!new_data) return NULL;
+
+    memcpy(new_data, da, la);
+    memcpy(new_data + la, db, lb);
+    new_data[new_length] = '\0';
+
+    return new_data;
+}
+
+// Length-bearing variant of string_concat. Returns an AetherString*
+// (refcounted, length-aware) rather than a bare char* — callers that
+// later run `string.length(result)` on this value read the stored
+// length from the magic-dispatch path rather than falling through to
+// strlen() and silently truncating at the first embedded NUL.
+//
+// Use this when the inputs may contain binary bytes (base64-decoded
+// payloads, file content from fs.read_binary, message frames with
+// length-prefix bytes, …). For ASCII-text accumulation in print /
+// interpolation contexts the plain `string_concat` is fine. See #270.
+AetherString* string_concat_wrapped(const void* a, const void* b) {
+    if (!a || !b) return NULL;
+    size_t la = str_len(a), lb = str_len(b);
+    const char* da = str_data(a);
+    const char* db = str_data(b);
+
+    if (la > SIZE_MAX - lb - 1) return NULL;
+    size_t new_length = la + lb;
+
+    char* joined = (char*)malloc(new_length + 1);
+    if (!joined) return NULL;
+    if (la) memcpy(joined, da, la);
+    if (lb) memcpy(joined + la, db, lb);
+    joined[new_length] = '\0';
+
+    AetherString* wrapped = string_new_with_length(joined, new_length);
+    free(joined);
+    return wrapped;
+}
+
+int string_length(const void* str) {
+    return (int)str_len(str);
+}
+
+char string_char_at(const void* str, int index) {
+    size_t len = str_len(str);
+    if (!str || index < 0 || index >= (int)len) return '\0';
+    return str_data(str)[index];
+}
+
+int string_equals(const void* a, const void* b) {
+    if (a == b) return 1;
+    if (!a || !b) return 0;
+    size_t la = str_len(a), lb = str_len(b);
+    if (la != lb) return 0;
+    return memcmp(str_data(a), str_data(b), la) == 0;
+}
+
+int string_compare(const void* a, const void* b) {
+    if (!a || !b) return 0;
+    return strcmp(str_data(a), str_data(b));
+}
+
+// String methods
+int string_starts_with(const void* str, const char* prefix) {
+    if (!str || !prefix) return 0;
+    size_t prefix_len = strlen(prefix);
+    size_t slen = str_len(str);
+    if (prefix_len > slen) return 0;
+    return memcmp(str_data(str), prefix, prefix_len) == 0;
+}
+
+int string_ends_with(const void* str, const char* suffix) {
+    if (!str || !suffix) return 0;
+    size_t suffix_len = strlen(suffix);
+    size_t slen = str_len(str);
+    if (suffix_len > slen) return 0;
+    return memcmp(str_data(str) + (slen - suffix_len),
+                  suffix, suffix_len) == 0;
+}
+
+int string_contains(const void* str, const char* substring) {
+    return string_index_of(str, substring) >= 0;
+}
+
+int string_index_of(const void* str, const char* substring) {
+    if (!str || !substring) return -1;
+    // Needle is binary-aware too: accepts AetherString* (for
+    // embedded NULs) or plain char*. Before this, passing an
+    // AetherString needle ran strlen past the struct header and
+    // returned garbage lengths — matters for packed-string
+    // protocols that use string_from_char(2) as a separator.
+    size_t sub_len = str_len(substring);
+    const char* sub_data = str_data(substring);
+    size_t slen = str_len(str);
+    const char* sdata = str_data(str);
+    if (sub_len > slen) return -1;
+
+    for (size_t i = 0; i <= slen - sub_len; i++) {
+        if (memcmp(sdata + i, sub_data, sub_len) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+// Like string_index_of but starts the scan at byte offset `start`.
+// Returns the absolute offset of the hit (not relative to `start`),
+// or -1 on miss. Negative `start` is clamped to 0; `start` past the
+// end returns -1.
+//
+// Both haystack and needle are binary-aware (accept AetherString*
+// or plain char*). Common idiom: scanning for the next record
+// separator in a multi-record packed string. Before this API,
+// callers did `substring(s, start, length) + index_of(tail, needle)
+// + start` which allocates a fresh copy of the tail on each step.
+int string_index_of_from(const void* str, const char* substring, int start) {
+    if (!str || !substring) return -1;
+    size_t sub_len = str_len(substring);
+    const char* sub_data = str_data(substring);
+    size_t slen = str_len(str);
+    const char* sdata = str_data(str);
+    if (start < 0) start = 0;
+    if ((size_t)start > slen) return -1;
+    if (sub_len > slen - (size_t)start) return -1;
+
+    for (size_t i = (size_t)start; i <= slen - sub_len; i++) {
+        if (memcmp(sdata + i, sub_data, sub_len) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+// Construct a 1-byte AetherString whose single byte is `code & 0xff`.
+// Fills the gap where callers want to encode a known ASCII / low-byte
+// marker (e.g. \x01, \x02) into a string without routing through a
+// NUL-terminated literal. `code` is masked to the low 8 bits —
+// higher bits are silently dropped (caller's responsibility not to
+// pass >255 for legitimate single-byte values).
+//
+// The returned AetherString length is always 1, even when `code` is
+// 0 (a NUL byte) — embedded NULs are preserved via
+// string_new_with_length, not string_new.
+AetherString* string_from_char(int code) {
+    char byte = (char)(code & 0xff);
+    return string_new_with_length(&byte, 1);
+}
+
+char* string_substring(const void* str, int start, int end) {
+    if (!str) return NULL;
+    size_t slen = str_len(str);
+    const char* sdata = str_data(str);
+    if (start < 0) start = 0;
+    if (end > (int)slen) end = (int)slen;
+    if (start >= end) {
+        char* empty = (char*)malloc(1);
+        if (empty) empty[0] = '\0';
+        return empty;
+    }
+
+    size_t len = end - start;
+    char* result = (char*)malloc(len + 1);
+    if (!result) return NULL;
+    memcpy(result, sdata + start, len);
+    result[len] = '\0';
+    return result;
+}
+
+char* string_to_upper(const void* str) {
+    if (!str) return NULL;
+    size_t slen = str_len(str);
+    const char* sdata = str_data(str);
+
+    char* new_data = (char*)malloc(slen + 1);
+    if (!new_data) return NULL;
+    for (size_t i = 0; i < slen; i++) {
+        new_data[i] = toupper(sdata[i]);
+    }
+    new_data[slen] = '\0';
+    return new_data;
+}
+
+char* string_to_lower(const void* str) {
+    if (!str) return NULL;
+    size_t slen = str_len(str);
+    const char* sdata = str_data(str);
+
+    char* new_data = (char*)malloc(slen + 1);
+    if (!new_data) return NULL;
+    for (size_t i = 0; i < slen; i++) {
+        new_data[i] = tolower(sdata[i]);
+    }
+    new_data[slen] = '\0';
+    return new_data;
+}
+
+char* string_trim(const void* str) {
+    if (!str) return NULL;
+    size_t slen = str_len(str);
+    const char* sdata = str_data(str);
+
+    size_t start = 0;
+    size_t end = slen;
+
+    while (start < slen && isspace(sdata[start])) start++;
+    while (end > start && isspace(sdata[end - 1])) end--;
+
+    size_t len = end - start;
+    char* result = (char*)malloc(len + 1);
+    if (!result) return NULL;
+    memcpy(result, sdata + start, len);
+    result[len] = '\0';
+    return result;
+}
+
+// Helper: free a partially-built array on OOM during split. Used on
+// every early-exit path so no cleanup branch leaks memory.
+static void string_array_partial_free(AetherStringArray* arr, size_t built) {
+    if (!arr) return;
+    if (arr->strings) {
+        for (size_t k = 0; k < built; k++) {
+            if (arr->strings[k]) string_release(arr->strings[k]);
+        }
+        free(arr->strings);
+    }
+    free(arr);
+}
+
+// String array operations
+AetherStringArray* string_split(const void* str, const char* delimiter) {
+    if (!str || !delimiter) return NULL;
+    size_t slen = str_len(str);
+    const char* sdata = str_data(str);
+    size_t delim_len = strlen(delimiter);
+
+    AetherStringArray* arr = (AetherStringArray*)malloc(sizeof(AetherStringArray));
+    if (!arr) return NULL;
+    arr->count = 0;
+    arr->strings = NULL;
+
+    // Empty delimiter → one entry per byte.
+    if (delim_len == 0) {
+        if (slen == 0) return arr;
+        arr->strings = (AetherString**)malloc(sizeof(AetherString*) * slen);
+        if (!arr->strings) { free(arr); return NULL; }
+        for (size_t i = 0; i < slen; i++) {
+            AetherString* piece = string_new_with_length(sdata + i, 1);
+            if (!piece) { string_array_partial_free(arr, i); return NULL; }
+            arr->strings[i] = piece;
+        }
+        arr->count = slen;
+        return arr;
+    }
+
+    // Input shorter than the delimiter → one piece, the whole input.
+    if (slen < delim_len) {
+        arr->strings = (AetherString**)malloc(sizeof(AetherString*));
+        if (!arr->strings) { free(arr); return NULL; }
+        arr->strings[0] = string_new_with_length(sdata, slen);
+        if (!arr->strings[0]) { free(arr->strings); free(arr); return NULL; }
+        arr->count = 1;
+        return arr;
+    }
+
+    // Count how many pieces we'll produce. At this point slen >= delim_len
+    // so the loop bound `slen - delim_len` won't underflow.
+    size_t count = 1;
+    size_t upper = slen - delim_len;
+    for (size_t i = 0; i <= upper; i++) {
+        if (memcmp(sdata + i, delimiter, delim_len) == 0) {
+            count++;
+            i += delim_len - 1;
+        }
+    }
+
+    arr->strings = (AetherString**)malloc(sizeof(AetherString*) * count);
+    if (!arr->strings) { free(arr); return NULL; }
+
+    size_t start = 0;
+    size_t idx = 0;
+    for (size_t i = 0; i <= upper; i++) {
+        if (memcmp(sdata + i, delimiter, delim_len) == 0) {
+            AetherString* piece = string_new_with_length(sdata + start, i - start);
+            if (!piece) { string_array_partial_free(arr, idx); return NULL; }
+            arr->strings[idx++] = piece;
+            start = i + delim_len;
+            i += delim_len - 1;
+        }
+    }
+    // Tail piece (may be empty if input ends with the delimiter).
+    AetherString* tail = string_new_with_length(sdata + start, slen - start);
+    if (!tail) { string_array_partial_free(arr, idx); return NULL; }
+    arr->strings[idx] = tail;
+    arr->count = count;
+
+    return arr;
+}
+
+int string_array_size(AetherStringArray* arr) {
+    return arr ? (int)arr->count : 0;
+}
+
+// Returns the raw C string data (const char*) for the element at index.
+// Aether treats strings as const char* — returning AetherString* would cause
+// printf("%s", ...) to print garbage (struct pointer instead of char data).
+const char* string_array_get(AetherStringArray* arr, int index) {
+    if (!arr || index < 0 || (size_t)index >= arr->count) return NULL;
+    AetherString* s = arr->strings[index];
+    return s ? s->data : NULL;
+}
+
+void string_array_free(AetherStringArray* arr) {
+    if (!arr) return;
+    for (size_t i = 0; i < arr->count; i++) {
+        string_release(arr->strings[i]);
+    }
+    free(arr->strings);
+    free(arr);
+}
+
+// Conversion
+const char* string_to_cstr(const void* str) {
+    if (!str) return "";
+    if (is_aether_string(str)) return ((const AetherString*)str)->data;
+    // Already a plain char*
+    return (const char*)str;
+}
+
+// Public FFI accessors. See aether_string.h for the rationale — C
+// shims that consume a `-> string` extern return must NOT treat the
+// pointer as `const char*` for memcpy/strlen, or they read into the
+// struct header. These helpers unwrap the AetherString if present and
+// fall back to strlen-based handling for plain char* returns (legacy
+// raw-TLS externs). Safe on NULL.
+const char* aether_string_data(const void* s) {
+    return str_data(s);
+}
+
+size_t aether_string_length(const void* s) {
+    return str_len(s);
+}
+
+AetherString* string_from_int(int value) {
+    char buffer[32];
+    snprintf(buffer, sizeof(buffer), "%d", value);
+    return string_new(buffer);
+}
+
+// Sibling of string_from_int that preserves the full 64-bit range.
+// `long long` covers Aether's `long` type; callers formatting byte
+// counts, file sizes, revision numbers, or other values that can
+// exceed INT_MAX reach for this instead of truncating through
+// `string_from_int`.
+AetherString* string_from_long(long long value) {
+    char buffer[32];
+    snprintf(buffer, sizeof(buffer), "%lld", value);
+    return string_new(buffer);
+}
+
+AetherString* string_from_float(float value) {
+    char buffer[64];
+    snprintf(buffer, sizeof(buffer), "%g", value);
+    return string_new(buffer);
+}
+
+// Parsing functions - convert string to numbers.
+// The `_raw` variants take an out-parameter and return 1/0 for ok/fail.
+// The Aether-native Go-style wrappers `string.to_int` etc. in module.ae
+// call the `_try`/`_get` pairs below for a cleaner tuple-return shape.
+int string_to_int_raw(const void* str, int* out_value) {
+    const char* data = str_data(str);
+    if (!str || !data[0] || !out_value) return 0;
+
+    char* endptr;
+    errno = 0;
+    long val = strtol(data, &endptr, 10);
+
+    // Check for errors: no conversion, overflow, or trailing garbage
+    if (endptr == data || errno == ERANGE || val > INT_MAX || val < INT_MIN) {
+        return 0;
+    }
+
+    // Skip trailing whitespace
+    while (*endptr && isspace((unsigned char)*endptr)) endptr++;
+    if (*endptr != '\0') return 0;  // Trailing non-whitespace
+
+    *out_value = (int)val;
+    return 1;
+}
+
+int string_to_long_raw(const void* str, long* out_value) {
+    const char* data = str_data(str);
+    if (!str || !data[0] || !out_value) return 0;
+
+    char* endptr;
+    errno = 0;
+    long val = strtol(data, &endptr, 10);
+
+    if (endptr == data || errno == ERANGE) {
+        return 0;
+    }
+
+    while (*endptr && isspace((unsigned char)*endptr)) endptr++;
+    if (*endptr != '\0') return 0;
+
+    *out_value = val;
+    return 1;
+}
+
+int string_to_float_raw(const void* str, float* out_value) {
+    const char* data = str_data(str);
+    if (!str || !data[0] || !out_value) return 0;
+
+    char* endptr;
+    errno = 0;
+    float val = strtof(data, &endptr);
+
+    if (endptr == data || errno == ERANGE) {
+        return 0;
+    }
+
+    while (*endptr && isspace((unsigned char)*endptr)) endptr++;
+    if (*endptr != '\0') return 0;
+
+    *out_value = val;
+    return 1;
+}
+
+int string_to_double_raw(const void* str, double* out_value) {
+    const char* data = str_data(str);
+    if (!str || !data[0] || !out_value) return 0;
+
+    char* endptr;
+    errno = 0;
+    double val = strtod(data, &endptr);
+
+    if (endptr == data || errno == ERANGE) {
+        return 0;
+    }
+
+    while (*endptr && isspace((unsigned char)*endptr)) endptr++;
+    if (*endptr != '\0') return 0;
+
+    *out_value = val;
+    return 1;
+}
+
+// Split-return helpers for Aether's Go-style tuple wrappers. Each `_try`
+// function returns 1 if the parse would succeed, 0 otherwise. The `_get`
+// function returns the parsed value (or 0/0.0 if unparseable). Callers
+// pair them: `if (try) return get(), ""; else return 0, "invalid"`.
+int string_try_int(const void* s) {
+    int v; return string_to_int_raw(s, &v);
+}
+int string_get_int(const void* s) {
+    int v = 0; string_to_int_raw(s, &v); return v;
+}
+int string_try_long(const void* s) {
+    long v; return string_to_long_raw(s, &v);
+}
+long string_get_long(const void* s) {
+    long v = 0; string_to_long_raw(s, &v); return v;
+}
+int string_try_float(const void* s) {
+    float v; return string_to_float_raw(s, &v);
+}
+float string_get_float(const void* s) {
+    float v = 0.0f; string_to_float_raw(s, &v); return v;
+}
+int string_try_double(const void* s) {
+    double v; return string_to_double_raw(s, &v);
+}
+double string_get_double(const void* s) {
+    double v = 0.0; string_to_double_raw(s, &v); return v;
+}
+
+// Printf-style string formatting
+AetherString* string_format(const char* fmt, ...) {
+    if (!fmt) return string_empty();
+
+    va_list args;
+
+    // First pass: calculate required size
+    va_start(args, fmt);
+    int size = vsnprintf(NULL, 0, fmt, args);
+    va_end(args);
+
+    if (size < 0) return string_empty();
+
+    // Allocate buffer
+    char* buffer = (char*)malloc(size + 1);
+    if (!buffer) return string_empty();
+
+    // Second pass: format string
+    va_start(args, fmt);
+    vsnprintf(buffer, size + 1, fmt, args);
+    va_end(args);
+
+    AetherString* result = string_new_with_length(buffer, size);
+    free(buffer);
+    return result;
+}
+
+/* Aether-callable formatter — Aether externs don't support varargs,
+ * so the public surface takes an ArrayList of arguments and walks
+ * the format string substituting `{}` placeholders with each list
+ * entry. Closes #272.
+ *
+ * Placeholders: `{}` is replaced with the next arg (Rust-style).
+ * `{{` is a literal `{`; `}}` is a literal `}`. List entries are
+ * read as strings (AetherString* or plain char*); ints and other
+ * types should be converted via `string.from_int(...)` first.
+ *
+ * Why `{}` not `%s`: it composes more cleanly with Aether's existing
+ * `${...}` interpolation surface (interpolation is for callsite-
+ * literal substitution; format is for runtime-built strings) and it
+ * leaves the `%`-prefix open for typed printf-style formatters
+ * (`%d`, `%.3f`) without breaking compatibility if those land later.
+ */
+extern int   list_size(void* list);
+extern void* list_get_raw(void* list, int index);
+
+AetherString* string_format_list(const char* fmt, void* args) {
+    if (!fmt) return string_empty();
+    int n_args = args ? list_size(args) : 0;
+    int next_arg = 0;
+
+    /* First pass: compute total length so we can allocate exactly
+     * once. Read placeholders and arg lengths to size the buffer. */
+    size_t total = 0;
+    const char* p = fmt;
+    while (*p) {
+        if (p[0] == '{' && p[1] == '{') { total++; p += 2; continue; }
+        if (p[0] == '}' && p[1] == '}') { total++; p += 2; continue; }
+        if (p[0] == '{' && p[1] == '}') {
+            if (next_arg < n_args) {
+                void* a = list_get_raw(args, next_arg);
+                size_t alen = a ? str_len(a) : 0;
+                total += alen;
+                next_arg++;
+            }
+            p += 2; continue;
+        }
+        total++; p++;
+    }
+
+    char* out = (char*)malloc(total + 1);
+    if (!out) return string_empty();
+
+    /* Second pass: write the bytes. */
+    next_arg = 0;
+    size_t pos = 0;
+    p = fmt;
+    while (*p) {
+        if (p[0] == '{' && p[1] == '{') { out[pos++] = '{'; p += 2; continue; }
+        if (p[0] == '}' && p[1] == '}') { out[pos++] = '}'; p += 2; continue; }
+        if (p[0] == '{' && p[1] == '}') {
+            if (next_arg < n_args) {
+                void* a = list_get_raw(args, next_arg);
+                if (a) {
+                    size_t alen = str_len(a);
+                    const char* adata = str_data(a);
+                    if (alen > 0) memcpy(out + pos, adata, alen);
+                    pos += alen;
+                }
+                next_arg++;
+            }
+            p += 2; continue;
+        }
+        out[pos++] = *p++;
+    }
+    out[pos] = '\0';
+
+    AetherString* result = string_new_with_length(out, pos);
+    free(out);
+    return result;
+}

@@ -1,0 +1,182 @@
+// std.string - String Module
+// Import with: import std.string
+
+exports (
+    string_new, string_from_cstr, string_from_literal,
+    string_new_with_length, string_empty,
+    string_retain, string_release, string_free,
+    string_concat, string_concat_wrapped, string_length, string_char_at,
+    string_equals, string_compare,
+    string_starts_with, string_ends_with, string_contains,
+    string_index_of, string_index_of_from, string_substring,
+    string_from_char, string_to_upper, string_to_lower, string_trim,
+    string_split, string_array_size, string_array_get, string_array_free,
+    string_to_cstr, string_from_int, string_from_long, string_from_float,
+    string_to_int_raw, string_to_long_raw, string_to_float_raw, string_to_double_raw,
+    string_try_int, string_get_int, string_try_long, string_get_long,
+    string_try_float, string_get_float, string_try_double, string_get_double,
+    to_int, to_long, to_float, to_double,
+    strip_prefix, copy,
+    string_format_list, format
+)
+
+// String creation
+extern string_new(cstr: string) -> ptr
+extern string_from_cstr(cstr: string) -> ptr
+extern string_from_literal(cstr: string) -> ptr
+extern string_new_with_length(data: string, length: int) -> ptr
+extern string_empty() -> ptr
+
+// Reference counting
+extern string_retain(str: string)
+extern string_release(str: string)
+extern string_free(str: string)
+
+// String operations
+extern string_concat(a: string, b: string) -> string
+// Length-bearing concat. Returns a refcounted AetherString; downstream
+// string.length() honours the stored length rather than falling
+// through to strlen() and silently truncating at the first NUL. Use
+// when joining inputs that may contain binary bytes (base64-decoded
+// payloads, fs.read_binary output, …). Issue #270.
+extern string_concat_wrapped(a: string, b: string) -> ptr
+extern string_length(str: string) -> int
+extern string_char_at(str: string, index: int) -> int
+extern string_equals(a: string, b: string) -> int
+extern string_compare(a: string, b: string) -> int
+
+// String methods
+extern string_starts_with(str: string, prefix: string) -> int
+extern string_ends_with(str: string, suffix: string) -> int
+extern string_contains(str: string, substring: string) -> int
+extern string_index_of(str: string, substring: string) -> int
+// Like index_of but starts scanning at byte offset `start`. Returns
+// the absolute offset of the hit (not relative to `start`), or -1.
+// Saves the substring+index_of allocation dance in hot loops that
+// scan a packed string record-by-record.
+extern string_index_of_from(str: string, substring: string, start: int) -> int
+extern string_substring(str: string, start: int, end: int) -> string
+
+// Construct a 1-byte string from a byte code (0..255). Typical use
+// is emitting known single-byte separators (\x01, \x02) into packed
+// formats without routing through a NUL-terminated string literal.
+// Always length 1 — code=0 returns a 1-byte NUL string, not "".
+extern string_from_char(code: int) -> ptr
+extern string_to_upper(str: string) -> string
+extern string_to_lower(str: string) -> string
+extern string_trim(str: string) -> string
+
+// String array operations
+extern string_split(str: string, delimiter: string) -> ptr
+extern string_array_size(arr: ptr) -> int
+extern string_array_get(arr: ptr, index: int) -> ptr
+extern string_array_free(arr: ptr)
+
+// Conversion
+extern string_to_cstr(str: string) -> string
+extern string_from_int(value: int) -> ptr
+extern string_from_long(value: long) -> ptr
+extern string_from_float(value: float) -> ptr
+
+// Parsing — raw externs (escape hatch)
+extern string_to_int_raw(str: string, out_value: ptr) -> int
+extern string_to_long_raw(str: string, out_value: ptr) -> int
+extern string_to_float_raw(str: string, out_value: ptr) -> int
+extern string_to_double_raw(str: string, out_value: ptr) -> int
+
+// Parsing — split-return helpers for the Go-style wrappers.
+extern string_try_int(s: string) -> int
+extern string_get_int(s: string) -> int
+extern string_try_long(s: string) -> int
+extern string_get_long(s: string) -> long
+extern string_try_float(s: string) -> int
+extern string_get_float(s: string) -> float
+extern string_try_double(s: string) -> int
+extern string_get_double(s: string) -> float
+
+// Parse a string to an integer. Returns (value, "") on success,
+// (0, error) on invalid input. Handles leading whitespace, sign,
+// base-10 digits. Trailing whitespace is ignored; trailing garbage
+// produces an error.
+to_int(s: string) -> {
+    ok = string_try_int(s)
+    if ok == 0 {
+        return 0, "invalid integer"
+    }
+    return string_get_int(s), ""
+}
+
+// Parse a string to a long (int64). Returns (value, "") on success,
+// (0, error) on invalid input.
+to_long(s: string) -> {
+    ok = string_try_long(s)
+    if ok == 0 {
+        return 0, "invalid long"
+    }
+    return string_get_long(s), ""
+}
+
+// Parse a string to a float. Returns (value, "") on success,
+// (0.0, error) on invalid input.
+to_float(s: string) -> {
+    ok = string_try_float(s)
+    if ok == 0 {
+        return 0.0, "invalid float"
+    }
+    return string_get_float(s), ""
+}
+
+// Parse a string to a double. Returns (value, "") on success,
+// (0.0, error) on invalid input.
+to_double(s: string) -> {
+    ok = string_try_double(s)
+    if ok == 0 {
+        return 0.0, "invalid double"
+    }
+    return string_get_double(s), ""
+}
+
+// If `s` starts with `prefix`, return (s-after-prefix, 1).
+// Otherwise return (s, 0). An empty prefix is treated as always
+// matching and leaves `s` unchanged — callers can use the 1/0
+// flag to tell "matched and stripped" from "no match".
+strip_prefix(s: string, prefix: string) -> {
+    if string_starts_with(s, prefix) != 1 {
+        return s, 0
+    }
+    prefix_len = string_length(prefix)
+    s_len = string_length(s)
+    return string_substring(s, prefix_len, s_len), 1
+}
+
+// Return an independently-owned copy of `s`. Useful when `s` is
+// borrowed from a TLS buffer or arena that the next C call will
+// overwrite — calling `copy` guarantees the returned string outlives
+// such a handoff. Equivalent to `string_concat(s, "")` but with a
+// discoverable name.
+copy(s: string) -> string {
+    return string_concat(s, "")
+}
+
+// Format a string by substituting `{}` placeholders with the
+// corresponding entries of `args` (an `std.list` of strings).
+// `{{` and `}}` are literal braces. Returns a refcounted
+// AetherString. Closes #272.
+//
+// Use this for runtime-built strings of N parts where literal
+// `${...}` interpolation isn't usable (e.g. when the format string
+// itself comes from a config file or message-template lookup):
+//
+//     args = list_new()
+//     list_add(args, "PUT")
+//     list_add(args, "/foo/bar")
+//     list_add(args, "alice")
+//     msg = string.format("{} {} by {}", args)   // "PUT /foo/bar by alice"
+//
+// Non-string values (ints, floats) need explicit conversion via
+// `string.from_int(n)` etc. before being added to the list.
+extern string_format_list(fmt: string, args: ptr) -> ptr
+
+format(fmt: string, args: ptr) -> string {
+    return string_format_list(fmt, args)
+}

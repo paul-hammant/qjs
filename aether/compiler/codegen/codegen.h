@@ -1,0 +1,214 @@
+#ifndef CODEGEN_H
+#define CODEGEN_H
+
+#include <stdio.h>
+#include "../ast.h"
+#include "../../runtime/actors/aether_message_registry.h"
+
+// Maximum defer nesting depth (scope depth * statements per scope)
+#define MAX_DEFER_STACK 256
+#define MAX_SCOPE_DEPTH 64
+
+typedef struct {
+    FILE* output;
+    int indent_level;
+    int actor_count;
+    int function_count;
+    char* current_actor;
+    char** actor_state_vars;
+    int state_var_count;
+    MessageRegistry* message_registry;
+    char** declared_vars;  // Track variables declared in current function
+    int declared_var_count;
+    int generating_lvalue;  // Track if we're generating an assignment target (lvalue)
+    int in_condition;  // Track if we're in a condition (if/while) to avoid double parens
+    int in_main_loop;  // Track if we're in main's loop for batch send optimization
+    int in_main_function;  // Track if we're in main() so return -> goto main_exit
+    int uses_main_exit;    // Track if any goto main_exit was emitted (suppress unused label)
+    int interp_as_printf;  // When set, string interp generates printf() instead of snprintf+malloc
+    ASTNode* program;  // Reference to program root for lookups
+
+    // Source file path threaded through to expand `__FILE__` at codegen
+    // time (#265). NULL is fine — `__FILE__` then emits "(unknown)".
+    const char* source_file;
+
+    // Header generation (--emit-header)
+    int emit_header;         // Whether to emit a C header file
+    FILE* header_file;       // Output stream for header
+    const char* header_path; // Path to header file
+
+    // --emit=<exe|lib|both> mode. Default is exe only.
+    // lib: omit `int main(int,char**)` entry; emit aether_<name> alias stubs.
+    // both: emit main() AND the aether_<name> stubs in the same .c file.
+    int emit_exe;            // Emit the int main(int,char**) entry point
+    int emit_lib;            // Emit aether_<name> alias stubs for top-level functions
+
+    // Track generated pattern matching functions to avoid duplicates
+    char** generated_functions;
+    int generated_function_count;
+
+    // Defer stack: tracks deferred statements for LIFO execution at scope exit
+    ASTNode* defer_stack[MAX_DEFER_STACK];
+    int defer_count;
+    int scope_defer_start[MAX_SCOPE_DEPTH];  // defer_count at scope entry
+    int scope_depth;
+
+    // Extern function parameter type registry — used at call sites for proper casts
+    // e.g., list_add(void*, void*) called with int arg → cast to (void*)(intptr_t)
+    struct ExternParamInfo {
+        char* name;          // Aether-side name (the namespace surface)
+        char* c_name;        // C symbol to emit at call sites; NULL = same as name.
+                             //   Set to a different value when the extern was declared
+                             //   via @extern("c_symbol") aether_name(...) — see #234.
+        TypeKind* params;    // array of parameter kinds (TYPE_PTR, TYPE_INT, ...)
+        int param_count;
+    }* extern_registry;
+    int extern_registry_count;
+    int extern_registry_capacity;
+
+    // MSVC compat: counter for ask-operator temp variables (_ask_result_N)
+    int ask_temp_counter;
+
+    // Counter for message-send array hoist variables (_aether_arr_N). Every
+    // `msg ! Foo { field: [a, b, c] }` with a composite array field
+    // allocates a `static const T _aether_arr_N[] = {...}` at the send
+    // site so the array's storage outlives the send-expression block and
+    // the receiving actor can safely read through the pointer.
+    int msg_arr_counter;
+
+    // Match-as-expression: when non-NULL, match arms assign to this variable
+    const char* match_result_var;
+
+    // Cooperative preemption: insert sched_yield() at loop back-edges
+    int preempt_loops;
+
+    // Current function's return type (for multi-return codegen)
+    Type* current_func_return_type;
+
+    // Tuple struct registry: track generated tuple typedefs to avoid duplicates
+    char** tuple_type_names;    // e.g., "_tuple_int_string"
+    int tuple_type_count;
+    int tuple_type_capacity;
+
+    // Builder function registry: functions with _ctx: ptr as first param
+    // get builder_context() auto-injected at call sites inside trailing blocks
+    char** builder_funcs;
+    int builder_func_count;
+    int builder_func_capacity;
+    int in_trailing_block;  // >0 when generating code inside a trailing block
+
+    // When emitting a closure body, captures in this list are mutated and
+    // therefore routed through _env->name on reassignment. Set per-closure
+    // by emit_closure_definitions, cleared after the body. NULL when not
+    // currently emitting a closure body.
+    char** current_env_captures;
+    int current_env_capture_count;
+
+    // Route 1 heap-promotion: variables in this list are heap-allocated
+    // cells (`int* name`) in the current function scope. Reads emit
+    // `(*name)`; writes emit `(*name) = expr`. Set at the start of any
+    // function/closure body whose enclosing function has promoted names,
+    // cleared on exit. The set is the union of captures that ANY closure
+    // in the enclosing function assigns to.
+    char** current_promoted_captures;
+    int current_promoted_capture_count;
+
+    // Per-function promoted-name map. Built during discover_closures as
+    // a precompute of which variables need heap promotion in each
+    // function body. Looked up when generating that function's body
+    // (either main's, a regular user function's, or a closure's — closures
+    // inherit from their parent_func).
+    struct PromotedFuncEntry {
+        char* func_name;    // "main" for main, user function name otherwise
+        char** names;       // promoted variable names
+        int count;
+    }* promoted_funcs;
+    int promoted_func_count;
+    int promoted_func_capacity;
+
+    // Builder function registry: functions marked with 'builder' keyword
+    // Block runs first (filling config), then function executes with config
+    struct BuilderFuncEntry {
+        char* name;
+        char* factory;  // Factory function name, NULL means "map_new"
+    } *builder_funcs_reg;
+    int builder_func_reg_count;
+    int builder_func_reg_capacity;
+
+    // Closure support: track closures for hoisted C function generation
+    int closure_counter;    // unique ID for closure env structs and functions
+    // Map variable names to closure IDs (set during variable declaration codegen)
+    struct ClosureVarMap {
+        char* var_name;
+        int closure_id;
+    }* closure_var_map;
+    int closure_var_count;
+    int closure_var_capacity;
+    // Pending closures: discovered during expression codegen, emitted at file scope
+    struct ClosureInfo {
+        int id;                  // unique closure ID
+        ASTNode* closure_node;   // AST_CLOSURE node
+        char** captures;         // captured variable names
+        Type** capture_types;    // captured variable types
+        int capture_count;
+        char* parent_func;       // enclosing function name (for nested context)
+    }* closures;
+    int closure_count;
+    int closure_capacity;
+
+    // Heap-owned string variables: variables whose current value is a
+    // heap-allocated string (from string_concat, string_substring, etc.).
+    // Used to emit free() on reassignment and avoid freeing string literals.
+    char** heap_string_vars;
+    int heap_string_var_count;
+
+    // Ask/reply type map: request message name -> reply message name.
+    // Built by scanning actor receive handlers for reply statements.
+    struct ReplyTypeEntry {
+        char* request_msg;   // e.g. "Add"
+        char* reply_msg;     // e.g. "Result"
+    }* reply_type_map;
+    int reply_type_count;
+    int reply_type_capacity;
+} CodeGenerator;
+
+// Code generation functions
+CodeGenerator* create_code_generator(FILE* output);
+CodeGenerator* create_code_generator_with_header(FILE* output, FILE* header, const char* header_path);
+void free_code_generator(CodeGenerator* gen);
+void generate_program(CodeGenerator* gen, ASTNode* program);
+/* L4 validation: reject closures inside actor handlers that write to
+   actor state fields. Call before generate_program. Returns 1 on
+   success, 0 if errors were reported (compilation should abort). */
+int validate_closure_state_mutations(CodeGenerator* gen, ASTNode* program);
+
+// Header generation (for C embedding)
+void emit_header_prologue(CodeGenerator* gen, const char* guard_name);
+void emit_header_epilogue(CodeGenerator* gen);
+void emit_message_to_header(CodeGenerator* gen, ASTNode* msg_def);
+void emit_actor_to_header(CodeGenerator* gen, ASTNode* actor);
+void generate_actor_definition(CodeGenerator* gen, ASTNode* actor);
+void generate_function_definition(CodeGenerator* gen, ASTNode* func);
+void generate_struct_definition(CodeGenerator* gen, ASTNode* struct_def);
+void generate_main_function(CodeGenerator* gen, ASTNode* main);
+void generate_statement(CodeGenerator* gen, ASTNode* stmt);
+void generate_expression(CodeGenerator* gen, ASTNode* expr);
+void generate_type(CodeGenerator* gen, Type* type);
+void ensure_tuple_typedef(CodeGenerator* gen, Type* type);
+
+// Utility functions
+void indent(CodeGenerator* gen);
+void print_indent(CodeGenerator* gen);
+void print_line(CodeGenerator* gen, const char* format, ...);
+void print_expression(CodeGenerator* gen, ASTNode* expr);
+const char* get_c_type(Type* type);
+const char* get_c_operator(const char* aether_op);
+
+// Defer management
+void push_defer(CodeGenerator* gen, ASTNode* stmt);
+void emit_defers_for_scope(CodeGenerator* gen);
+void emit_all_defers(CodeGenerator* gen);
+void enter_scope(CodeGenerator* gen);
+void exit_scope(CodeGenerator* gen);
+
+#endif

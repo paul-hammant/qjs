@@ -1,0 +1,129 @@
+// std.os - Shell & Process Execution
+// Import with: import std.os
+
+exports (
+    os_system, os_exec_raw, os_run, os_run_capture_raw, os_run_capture_status_raw,
+    os_getenv, os_which,
+    aether_args_count, aether_args_get, aether_argv0,
+    os_execv, os_now_utc_iso8601_raw,
+    exec, run_capture, argv0, now_utc_iso8601
+)
+
+// Run a shell command, returns exit code (0 = success)
+extern os_system(cmd: string) -> int
+
+// Run a command and capture stdout as a string. Raw extern returns
+// NULL on failure. Use the Go-style wrapper `os.exec` below in most code.
+extern os_exec_raw(cmd: string) -> string
+
+// Run a child process directly via fork+execvp+waitpid (POSIX). NO SHELL
+// is interpreted: argv items are passed verbatim, so paths-with-spaces,
+// $variables, |, ;, *, and other shell metacharacters in arguments are
+// not metachars. Returns the child's exit code, or -1 on spawn failure.
+//
+//   prog  — program to execute (resolved via PATH if it has no '/')
+//   argv  — list of strings to pass as arguments AFTER argv[0]=prog,
+//           or null/empty list for no arguments
+//   env   — list of "KEY=VALUE" strings to pass as the child's
+//           environment, or null to inherit the parent's environment
+extern os_run(prog: string, argv: ptr, env: ptr) -> int
+
+// Same as os_run but captures the child's stdout. Raw extern returns
+// null on spawn failure. Use the Go-style wrapper `os.run_capture` in
+// most code. The child's exit code is discarded — use os_run, or the
+// tuple-returning `os_run_capture_status_raw` below, if you need both.
+extern os_run_capture_raw(prog: string, argv: ptr, env: ptr) -> string
+
+// Tuple sibling that exposes the child's exit code. Returns
+// (stdout, status, err) — see the Aether-side `run_capture` wrapper
+// for the per-slot semantics. Issue #289.
+extern os_run_capture_status_raw(prog: string, argv: ptr, env: ptr) -> (string, int, string)
+
+// Get environment variable, returns string or NULL if not set
+extern os_getenv(name: string) -> string
+
+// Search PATH for an executable. Returns the absolute path to the
+// first hit, or "" if not found. If `name` already contains '/', it's
+// returned as-is when it's executable.
+extern os_which(name: string) -> string
+
+// Command-line arguments
+extern aether_args_count() -> int
+extern aether_args_get(index: int) -> string
+
+// argv[0] — the path the OS launched the current process with. Returns
+// null when aether_args_init has not been called (e.g. unit tests that
+// bypass `main`). The return value is a borrowed pointer into the OS
+// argv storage; do not free. Idiomatic Aether callers should use
+// `os.argv0()` which returns "" instead of null for convenience.
+extern aether_argv0() -> string
+
+// Replace the current process image with `prog`. `argv_list` is a
+// list<ptr> of C strings (element 0 is argv[0] for the new program and
+// does NOT need to match `prog`). On success this call never returns;
+// on failure it returns -1 with the current process still running.
+// `prog` is looked up on PATH if it does not contain a slash.
+// Not available on Windows — returns -1 there.
+extern os_execv(prog: string, argv_list: ptr) -> int
+
+// string_concat used to detach the borrowed output string from the
+// internal popen buffer.
+extern string_concat(a: string, b: string) -> string
+
+// Execute a shell command and capture stdout. Returns (output, "")
+// on success, ("", error) on failure.
+exec(cmd: string) -> {
+    output = os_exec_raw(cmd)
+    if output == null {
+        return "", "command failed"
+    }
+    output_copy = string_concat(output, "")
+    return output_copy, ""
+}
+
+// Run a child process and capture its stdout. Returns
+// `(output, status, err)`:
+//   - output: child's stdout. Empty string on spawn failure.
+//   - status: child's exit code (WEXITSTATUS) on normal exit;
+//             -1 when killed by signal or the spawn itself failed.
+//   - err:    "" on successful spawn regardless of exit code;
+//             non-empty only when the fork/exec couldn't run.
+//
+// Argv-based — no shell, no quoting issues. The status slot lets
+// callers distinguish "ran cleanly" (status == 0) from "ran but
+// exited non-zero" (e.g. `diff3 -m` returning 1 to signal conflicts,
+// `grep` returning 1 for no-match, `gcc` returning non-zero on
+// compile errors). Issue #289.
+run_capture(prog: string, argv: ptr, env: ptr) -> {
+    return os_run_capture_status_raw(prog, argv, env)
+}
+
+// argv[0] — path the OS launched the current process with. Returns "" if
+// aether_args_init has not been called or argv[0] is NULL. The raw form
+// is also accessible as `aether_argv0()` for callers that want explicit
+// null handling (e.g. to distinguish "not initialised" from "empty").
+argv0() -> {
+    raw = aether_argv0()
+    if raw == null {
+        return ""
+    }
+    return string_concat(raw, "")
+}
+
+// Current UTC time as an ISO-8601 timestamp: "YYYY-MM-DDThh:mm:ssZ"
+// (20 chars). Thread-safe (gmtime_r on POSIX, gmtime_s on Windows).
+// On clock / format failure returns an empty string — never null.
+//
+// Typical use: "when did this event happen" fields where a sortable,
+// human-readable UTC timestamp is wanted (rev-blob date fields, JSON
+// response timestamps, log-line prefixes). Sub-second precision and
+// timezone offsets are out of scope; additive variants can land later.
+extern os_now_utc_iso8601_raw() -> string
+
+now_utc_iso8601() -> string {
+    s = os_now_utc_iso8601_raw()
+    if s == null {
+        return ""
+    }
+    return string_concat(s, "")
+}
