@@ -539,6 +539,7 @@ static const char* type_name(Type* t) {
         case TYPE_UINT64:   return "uint64";
         case TYPE_FLOAT:    return "float";
         case TYPE_BOOL:     return "bool";
+        case TYPE_BYTE:     return "byte";
         case TYPE_STRING:   return "string";
         case TYPE_VOID:     return "void";
         case TYPE_PTR:      return "ptr";
@@ -689,6 +690,14 @@ int is_type_compatible(Type* from, Type* to) {
     // int ↔ ptr compatibility (e.g. x = 0 then x = ptr_func(), or passing 0 to ptr param)
     if (from->kind == TYPE_INT && to->kind == TYPE_PTR) return 1;
     if (from->kind == TYPE_PTR && to->kind == TYPE_INT) return 1;
+
+    // byte compatibility
+    if (from->kind == TYPE_BYTE && (to->kind == TYPE_INT || to->kind == TYPE_INT64)) return 1;
+    if (to->kind == TYPE_BYTE && (from->kind == TYPE_INT || from->kind == TYPE_INT64)) return 1;
+
+    // Pointer arithmetic: ptr + int -> ptr
+    if (from->kind == TYPE_PTR && (to->kind == TYPE_INT || to->kind == TYPE_INT64)) return 1;
+    if (to->kind == TYPE_PTR && (from->kind == TYPE_INT || from->kind == TYPE_INT64)) return 1;
 
     return 0;
 }
@@ -900,6 +909,20 @@ Type* infer_binary_type(ASTNode* left, ASTNode* right, AeTokenType operator) {
                 // If either type is unknown (e.g., unresolved parameter), allow it
                 return create_type(TYPE_UNKNOWN);
             }
+
+            // Pointer arithmetic
+            if (operator == TOKEN_PLUS || operator == TOKEN_MINUS) {
+                if (left_type->kind == TYPE_PTR && (right_type->kind == TYPE_INT || right_type->kind == TYPE_INT64)) {
+                    return create_type(TYPE_PTR);
+                }
+                if (operator == TOKEN_PLUS && right_type->kind == TYPE_PTR && (left_type->kind == TYPE_INT || left_type->kind == TYPE_INT64)) {
+                    return create_type(TYPE_PTR);
+                }
+                if (operator == TOKEN_MINUS && left_type->kind == TYPE_PTR && right_type->kind == TYPE_PTR) {
+                    return create_type(TYPE_INT); // ptr - ptr -> int
+                }
+            }
+
             if (left_type->kind == TYPE_FLOAT || right_type->kind == TYPE_FLOAT) {
                 return create_type(TYPE_FLOAT);
             }
@@ -2640,6 +2663,17 @@ int typecheck_expression(ASTNode* expr, SymbolTable* table) {
             if (expr->child_count >= 2) {
                 typecheck_expression(expr->children[0], table);
                 typecheck_expression(expr->children[1], table);
+
+                Type* base_type = infer_type(expr->children[0], table);
+                if (base_type && base_type->kind == TYPE_PTR) {
+                    // Enable indexing on ptr types, default to byte access
+                    if (!expr->node_type || expr->node_type->kind == TYPE_UNKNOWN) {
+                        if (expr->node_type) free_type(expr->node_type);
+                        expr->node_type = create_type(TYPE_BYTE);
+                    }
+                }
+                if (base_type) free_type(base_type);
+
                 Type* idx_type = infer_type(expr->children[1], table);
                 if (idx_type && idx_type->kind != TYPE_INT && idx_type->kind != TYPE_INT64
                     && idx_type->kind != TYPE_UNKNOWN) {
@@ -2710,7 +2744,8 @@ int typecheck_expression(ASTNode* expr, SymbolTable* table) {
 
                 // Reject member access on primitive types — catch the error in Aether, not C
                 if (base_type && (base_type->kind == TYPE_INT || base_type->kind == TYPE_FLOAT ||
-                                  base_type->kind == TYPE_BOOL || base_type->kind == TYPE_STRING)) {
+                                  base_type->kind == TYPE_BOOL || base_type->kind == TYPE_BYTE ||
+                                  base_type->kind == TYPE_STRING)) {
                     char error_msg[256];
                     snprintf(error_msg, sizeof(error_msg),
                              "Type '%s' has no field '%s'",

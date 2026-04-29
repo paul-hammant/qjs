@@ -1391,12 +1391,12 @@ void emit_message_field_init(CodeGenerator* gen, MessageFieldDef* fdef, ASTNode*
 // Emit a send target expression with the correct C cast.
 // Actor refs produce (ActorBase*)(expr) directly.
 // Int/int64 values (actor refs stored in int message fields or state) need
-// (ActorBase*)(intptr_t)(expr) to avoid pointer-width conversion warnings.
+// (ActorBase*)(uintptr_t)(expr) to avoid pointer-width conversion warnings.
 static void emit_send_target(CodeGenerator* gen, ASTNode* target, const char* cast_type) {
     int needs_intptr = target->node_type &&
         (target->node_type->kind == TYPE_INT || target->node_type->kind == TYPE_INT64);
     fprintf(gen->output, "(%s)(", cast_type);
-    if (needs_intptr) fprintf(gen->output, "(intptr_t)");
+    if (needs_intptr) fprintf(gen->output, "(uintptr_t)");
     generate_expression(gen, target);
     fprintf(gen->output, ")");
 }
@@ -1666,14 +1666,14 @@ void generate_expression(CodeGenerator* gen, ASTNode* expr) {
                     if (is_assignment) {
                         gen->generating_lvalue = 1;
                     }
-                    if (ptr_int_cmp && lhs_is_ptr) fprintf(gen->output, "(intptr_t)");
+                    if (ptr_int_cmp && lhs_is_ptr) fprintf(gen->output, "(uintptr_t)");
                     generate_expression(gen, expr->children[0]);
                     if (is_assignment) {
                         gen->generating_lvalue = 0;
                     }
 
                     fprintf(gen->output, " %s ", get_c_operator(expr->value));
-                    if (ptr_int_cmp && rhs_is_ptr) fprintf(gen->output, "(intptr_t)");
+                    if (ptr_int_cmp && rhs_is_ptr) fprintf(gen->output, "(uintptr_t)");
                     generate_expression(gen, expr->children[1]);
                     if (!skip_parens) fprintf(gen->output, ")");
                 }
@@ -1771,6 +1771,10 @@ void generate_expression(CodeGenerator* gen, ASTNode* expr) {
                             fprintf(gen->output, "printf(\"%%s\", _aether_safe_str(");
                             generate_expression(gen, arg);
                             fprintf(gen->output, "))");
+                        } else if (arg_type->kind == TYPE_BYTE) {
+                            fprintf(gen->output, "printf(\"%%u\", ");
+                            generate_expression(gen, arg);
+                            fprintf(gen->output, ")");
                         } else if (arg_type->kind == TYPE_BOOL) {
                             fprintf(gen->output, "printf(\"%%s\", ");
                             generate_expression(gen, arg);
@@ -1810,6 +1814,7 @@ void generate_expression(CodeGenerator* gen, ASTNode* expr) {
                                 } else if (arg_idx < expr->child_count) {
                                     Type* atype = expr->children[arg_idx]->node_type;
                                     if (atype && atype->kind == TYPE_FLOAT) fprintf(gen->output, "%%f");
+                                    else if (atype && atype->kind == TYPE_BYTE) fprintf(gen->output, "%%u");
                                     else if (atype && atype->kind == TYPE_INT64) fprintf(gen->output, "%%lld");
                                     else if (atype && (atype->kind == TYPE_STRING || atype->kind == TYPE_PTR)) fprintf(gen->output, "%%s");
                                     else if (atype && atype->kind == TYPE_BOOL) fprintf(gen->output, "%%s");
@@ -2008,11 +2013,11 @@ void generate_expression(CodeGenerator* gen, ASTNode* expr) {
                 // ref(value) — create a heap-allocated mutable cell
                 else if (strcmp(func_name, "ref") == 0 && expr->child_count == 1) {
                     fprintf(gen->output, "\n#if AETHER_GCC_COMPAT\n");
-                    fprintf(gen->output, "({ intptr_t* _r = malloc(sizeof(intptr_t)); *_r = (intptr_t)(");
+                    fprintf(gen->output, "({ intptr_t* _r = malloc(sizeof(uintptr_t)); *_r = (uintptr_t)(");
                     generate_expression(gen, expr->children[0]);
                     fprintf(gen->output, "); (void*)_r; })");
                     fprintf(gen->output, "\n#else\n");
-                    fprintf(gen->output, "_aether_ref_new((intptr_t)(");
+                    fprintf(gen->output, "_aether_ref_new((uintptr_t)(");
                     generate_expression(gen, expr->children[0]);
                     fprintf(gen->output, "))");
                     fprintf(gen->output, "\n#endif\n");
@@ -2027,7 +2032,7 @@ void generate_expression(CodeGenerator* gen, ASTNode* expr) {
                 else if (strcmp(func_name, "ref_set") == 0 && expr->child_count == 2) {
                     fprintf(gen->output, "(*(intptr_t*)");
                     generate_expression(gen, expr->children[0]);
-                    fprintf(gen->output, " = (intptr_t)(");
+                    fprintf(gen->output, " = (uintptr_t)(");
                     generate_expression(gen, expr->children[1]);
                     fprintf(gen->output, "))");
                 }
@@ -2197,7 +2202,7 @@ void generate_expression(CodeGenerator* gen, ASTNode* expr) {
                 }
                 // ctx_push(ptr) / ctx_pop() — explicit context stack manipulation
                 else if (strcmp(func_name, "sandbox_push") == 0 && expr->child_count == 1) {
-                    fprintf(gen->output, "_aether_ctx_push((void*)(intptr_t)");
+                    fprintf(gen->output, "_aether_ctx_push((void*)(uintptr_t)");
                     generate_expression(gen, expr->children[0]);
                     fprintf(gen->output, ")");
                 }
@@ -2459,7 +2464,7 @@ void generate_expression(CodeGenerator* gen, ASTNode* expr) {
                         }
                         if (expected == TYPE_PTR && arg->node_type &&
                             (arg->node_type->kind == TYPE_INT || arg->node_type->kind == TYPE_BOOL)) {
-                            fprintf(gen->output, "(void*)(intptr_t)(");
+                            fprintf(gen->output, "(void*)(uintptr_t)(");
                             generate_expression(gen, arg);
                             fprintf(gen->output, ")");
                         } else if (expected == TYPE_PTR && arg->node_type &&
@@ -2581,6 +2586,7 @@ void generate_expression(CodeGenerator* gen, ASTNode* expr) {
                             case TYPE_UINT64: fprintf(gen->output, "%%llu"); break; \
                             case TYPE_FLOAT:  fprintf(gen->output, "%%g");  break; \
                             case TYPE_BOOL:   fprintf(gen->output, "%%s");  break; \
+                            case TYPE_BYTE:   fprintf(gen->output, "%%u");  break; \
                             case TYPE_STRING: fprintf(gen->output, "%%s");  break; \
                             case TYPE_PTR:    fprintf(gen->output, "%%s");  break; \
                             default:          fprintf(gen->output, "%%d");  break; \
@@ -2710,7 +2716,7 @@ void generate_expression(CodeGenerator* gen, ASTNode* expr) {
                                     ASTNode* val = field_init->children[0];
                                     int is_actor_ref = val->node_type && val->node_type->kind == TYPE_ACTOR_REF;
                                     if (is_actor_ref || fk == TYPE_INT64 || fk == TYPE_PTR || fk == TYPE_ACTOR_REF)
-                                        fprintf(gen->output, "(intptr_t)");
+                                        fprintf(gen->output, "(uintptr_t)");
                                     generate_expression(gen, val);
                                     break;
                                 }
@@ -2823,6 +2829,7 @@ void generate_expression(CodeGenerator* gen, ASTNode* expr) {
                             switch (reply_field_type) {
                                 case TYPE_FLOAT:   c_type = "double"; c_zero = "0.0"; break;
                                 case TYPE_BOOL:    c_type = "int";    c_zero = "0";   break;
+                                case TYPE_BYTE:    c_type = "unsigned char"; c_zero = "0"; break;
                                 case TYPE_STRING:  c_type = "const char*"; c_zero = "NULL"; break;
                                 case TYPE_INT64:   c_type = "int64_t"; c_zero = "0";  break;
                                 case TYPE_UINT64:  c_type = "uint64_t"; c_zero = "0"; break;
@@ -2834,7 +2841,7 @@ void generate_expression(CodeGenerator* gen, ASTNode* expr) {
                             fprintf(gen->output, "free(_ask_r); _ask_val; })");
                         } else {
                             // Fallback: return raw pointer as intptr_t
-                            fprintf(gen->output, "intptr_t _ask_val = (intptr_t)(uintptr_t)_ask_r; _ask_val; })");
+                            fprintf(gen->output, "intptr_t _ask_val = (uintptr_t)_ask_r; _ask_val; })");
                         }
 
                         fprintf(gen->output, "\n#else\n");
@@ -2868,7 +2875,7 @@ void generate_expression(CodeGenerator* gen, ASTNode* expr) {
                             }
                             fprintf(gen->output, "))");
                         } else {
-                            fprintf(gen->output, "0, sizeof(intptr_t))");
+                            fprintf(gen->output, "0, sizeof(uintptr_t))");
                         }
                         fprintf(gen->output, "\n#endif\n");
                     } else {

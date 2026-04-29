@@ -1,0 +1,26 @@
+/* list.ae - Doubly linked list for Aether port */
+
+struct list_head {
+    next: ptr,
+    prev: ptr
+}
+
+// In Aether, we can't easily do el->next = el because ptr indexing
+// is byte-based. We'd need something like:
+// func list_init(el: ptr) {
+//     let head = el as list_head; // If Aether supported pointer casting to structs
+//     head.next = el;
+//     head.prev = el;
+// }
+
+func list_init(el: ptr) {
+    // Placeholder for when Aether supports struct-over-pointer casting
+}
+
+func list_add(new_el: ptr, head: ptr) {
+    // Implementation pending pointer-to-struct casting
+}
+
+func list_empty(head: ptr) : bool {
+    return false
+}
