@@ -59,6 +59,7 @@ typedef enum {
     TOKEN_FLOAT,
     TOKEN_BOOL,
     TOKEN_STRING,
+    TOKEN_BYTE,             // 'byte' type for uint8_t
     TOKEN_ACTOR_REF,
     TOKEN_MESSAGE,
     TOKEN_PTR,              // 'ptr' type for void* (C interop)

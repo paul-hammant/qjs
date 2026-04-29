@@ -1765,6 +1765,8 @@ void generate_statement(CodeGenerator* gen, ASTNode* stmt) {
                             match_c_type = "int64_t";
                         else if (mexpr_type->kind == TYPE_BOOL)
                             match_c_type = "bool";
+                        else if (mexpr_type->kind == TYPE_BYTE)
+                            match_c_type = "unsigned char";
                     }
                     print_indent(gen);
                     fprintf(gen->output, "%s _match_val = ", match_c_type);
@@ -2369,6 +2371,10 @@ void generate_statement(CodeGenerator* gen, ASTNode* stmt) {
                         fprintf(gen->output, "printf(\"%%s\", _aether_safe_str(");
                         generate_expression(gen, first_arg);
                         fprintf(gen->output, "));\n");
+                    } else if (arg_type->kind == TYPE_BYTE) {
+                        fprintf(gen->output, "printf(\"%%u\", ");
+                        generate_expression(gen, first_arg);
+                        fprintf(gen->output, ");\n");
                     } else if (arg_type->kind == TYPE_BOOL) {
                         fprintf(gen->output, "printf(\"%%s\", ");
                         generate_expression(gen, first_arg);
@@ -2436,6 +2442,8 @@ void generate_statement(CodeGenerator* gen, ASTNode* stmt) {
                                         fprintf(gen->output, "%%lld");
                                     } else if (atype && (atype->kind == TYPE_STRING || atype->kind == TYPE_PTR)) {
                                         fprintf(gen->output, "%%s");
+                                    } else if (atype && atype->kind == TYPE_BYTE) {
+                                        fprintf(gen->output, "%%u");
                                     } else if (atype && atype->kind == TYPE_BOOL) {
                                         fprintf(gen->output, "%%s");
                                     } else {
@@ -2467,6 +2475,8 @@ void generate_statement(CodeGenerator* gen, ASTNode* stmt) {
                             Type* atype = arg->node_type;
                             if (atype && atype->kind == TYPE_INT64) {
                                 fprintf(gen->output, "(long long)");
+                                generate_expression(gen, arg);
+                            } else if (atype && atype->kind == TYPE_BYTE) {
                                 generate_expression(gen, arg);
                             } else if (atype && atype->kind == TYPE_BOOL) {
                                 generate_expression(gen, arg);

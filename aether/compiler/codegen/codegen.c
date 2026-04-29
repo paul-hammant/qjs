@@ -562,6 +562,7 @@ void emit_actor_to_header(CodeGenerator* gen, ASTNode* actor) {
                             switch (field->type_kind) {
                                 case TYPE_INT: c_type = "int"; break;
                                 case TYPE_FLOAT: c_type = "float"; break;
+                                case TYPE_BYTE: c_type = "unsigned char"; break;
                                 case TYPE_STRING: c_type = "const char*"; break;
                                 case TYPE_BOOL: c_type = "int"; break;
                                 default: c_type = "int"; break;
@@ -647,6 +648,7 @@ const char* get_c_type(Type* type) {
         case TYPE_UINT64: return "uint64_t";
         case TYPE_FLOAT: return "float";
         case TYPE_BOOL: return "int";
+        case TYPE_BYTE: return "unsigned char";
         case TYPE_STRING: return "const char*";
         case TYPE_VOID: return "void";
         case TYPE_ACTOR_REF: {
@@ -747,6 +749,7 @@ static const char* get_abi_type(Type* type) {
         case TYPE_UINT64: return "uint64_t";
         case TYPE_FLOAT:  return "float";
         case TYPE_BOOL:   return "int32_t";
+        case TYPE_BYTE:   return "unsigned char";
         case TYPE_STRING: return "const char*";
         case TYPE_VOID:   return "void";
         case TYPE_PTR:    return "AetherValue*";

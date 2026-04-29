@@ -55,6 +55,7 @@ Token* advance_token(Parser* parser) {
 // TOKEN_IDENTIFIER itself and anything whose value is punctuation.
 static int token_is_reserved_keyword(Token* token) {
     if (!token || !token->value || token->type == TOKEN_IDENTIFIER) return 0;
+    if (token->type == TOKEN_BYTE || token->type == TOKEN_PTR) return 0;
     const char* s = token->value;
     if (!((*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z') || *s == '_')) return 0;
     for (const char* p = s + 1; *p; p++) {
@@ -190,6 +191,10 @@ Type* parse_type(Parser* parser) {
         case TOKEN_BOOL:
             advance_token(parser);
             type = create_type(TYPE_BOOL);
+            break;
+        case TOKEN_BYTE:
+            advance_token(parser);
+            type = create_type(TYPE_BYTE);
             break;
         case TOKEN_STRING:
             advance_token(parser);
@@ -507,7 +512,9 @@ ASTNode* parse_primary_expression(Parser* parser) {
         case TOKEN_STRING:
         case TOKEN_INT:
         case TOKEN_FLOAT:
-        case TOKEN_BOOL: {
+        case TOKEN_BOOL:
+        case TOKEN_BYTE:
+        case TOKEN_PTR: {
             // Check if followed by dot - treat as namespace identifier
             Token* next = peek_ahead(parser, 1);
             if (next && next->type == TOKEN_DOT) {
@@ -1150,7 +1157,9 @@ ASTNode* parse_statement(Parser* parser) {
         case TOKEN_INT64:
         case TOKEN_STRING:
         case TOKEN_FLOAT:
-        case TOKEN_BOOL: {
+        case TOKEN_BOOL:
+        case TOKEN_BYTE:
+        case TOKEN_PTR: {
             // Check if this is a namespace call: string.func() vs type declaration: string x = ...
             Token* next = peek_ahead(parser, 1);
             if (next && next->type == TOKEN_DOT) {
@@ -1936,6 +1945,7 @@ ASTNode* parse_export_statement(Parser* parser) {
         case TOKEN_INT64:
         case TOKEN_FLOAT:
         case TOKEN_BOOL:
+        case TOKEN_BYTE:
         case TOKEN_STRING:
         case TOKEN_PTR: {
             // C-style: export int func_name(...) { ... }
@@ -2720,6 +2730,7 @@ ASTNode* parse_function_definition(Parser* parser) {
                 case TOKEN_INT64:
                 case TOKEN_FLOAT:
                 case TOKEN_BOOL:
+                case TOKEN_BYTE:
                 case TOKEN_STRING:
                 case TOKEN_MESSAGE:
                 case TOKEN_PTR:
@@ -2759,6 +2770,7 @@ ASTNode* parse_function_definition(Parser* parser) {
                             case TOKEN_INT64:
                             case TOKEN_FLOAT:
                             case TOKEN_BOOL:
+                            case TOKEN_BYTE:
                             case TOKEN_STRING:
                             case TOKEN_MESSAGE:
                             case TOKEN_PTR:
@@ -2922,6 +2934,7 @@ ASTNode* parse_pattern(Parser* parser) {
         case TOKEN_INT64:
         case TOKEN_FLOAT:
         case TOKEN_BOOL:
+        case TOKEN_BYTE:
         case TOKEN_STRING:
         case TOKEN_PTR: {
             // Check if next token is an identifier (type name pattern)
@@ -3339,6 +3352,7 @@ ASTNode* parse_program(Parser* parser) {
             case TOKEN_INT64:
             case TOKEN_FLOAT:
             case TOKEN_BOOL:
+            case TOKEN_BYTE:
             case TOKEN_STRING:
             case TOKEN_PTR: {
                 Token* next = peek_ahead(parser, 1);

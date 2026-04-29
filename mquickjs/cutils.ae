@@ -1,0 +1,41 @@
+/* Utility functions for Aether port of MicroQuickJS */
+
+func p_realloc(p: ptr, old_size: int, new_size: int) : ptr {
+    if (new_size == 0) {
+        if (p != null) {
+            free(p);
+        }
+        return null;
+    }
+
+    // Fallback: use malloc and copy since Aether stdlib doesn't expose realloc yet
+    let new_p = malloc(new_size);
+    if (p != null) {
+        let copy_size = old_size;
+        if (new_size < old_size) {
+            copy_size = new_size;
+        }
+
+        let i = 0;
+        while (i < copy_size) {
+            new_p[i] = p[i];
+            i = i + 1;
+        }
+        free(p);
+    }
+    return new_p;
+}
+
+func main() {
+    let p = malloc(10);
+    if (p == null) { return; }
+
+    p[0] = 42;
+    p[1] = 43;
+
+    let p2 = p_realloc(p, 10, 20);
+    if (p2 != null) {
+        printf("p2[0]=%u, p2[1]=%u\n", p2[0], p2[1]);
+        free(p2);
+    }
+}

@@ -109,6 +109,7 @@ typedef enum {
     TYPE_UINT64,
     TYPE_FLOAT,
     TYPE_BOOL,
+    TYPE_BYTE,
     TYPE_STRING,
     TYPE_ACTOR_REF,
     TYPE_MESSAGE,
