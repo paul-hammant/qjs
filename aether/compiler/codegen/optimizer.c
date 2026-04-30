@@ -29,7 +29,7 @@ static int is_constant(ASTNode* node) {
     // Exclude booleans and strings from numeric constant folding
     if (node->node_type) {
         if (node->node_type->kind == TYPE_STRING) return 0;
-        if (node->node_type->kind == TYPE_BOOL || node->node_type->kind == TYPE_BYTE) return 0;
+        if (node->node_type->kind == TYPE_BOOL) return 0;
     }
     // Also check by value for untyped literals
     if (strcmp(node->value, "true") == 0 || strcmp(node->value, "false") == 0) return 0;

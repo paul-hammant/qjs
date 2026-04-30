@@ -35,6 +35,11 @@ int contains_send_expression(ASTNode* node) {
     return 0;
 }
 
+// Tree-shake of merged-but-unused stdlib functions runs in
+// module_prune_unreachable() before typecheck — see aether_module.c.
+// Codegen no longer needs a separate pass; by this point the AST only
+// contains functions the user actually reaches.
+
 static int is_inlineable_scalar(int type_kind) {
     switch (type_kind) {
         case TYPE_INT: case TYPE_INT64: case TYPE_PTR:
@@ -562,9 +567,9 @@ void emit_actor_to_header(CodeGenerator* gen, ASTNode* actor) {
                             switch (field->type_kind) {
                                 case TYPE_INT: c_type = "int"; break;
                                 case TYPE_FLOAT: c_type = "float"; break;
-                                case TYPE_BYTE: c_type = "unsigned char"; break;
                                 case TYPE_STRING: c_type = "const char*"; break;
                                 case TYPE_BOOL: c_type = "int"; break;
+                                case TYPE_BYTE: c_type = "unsigned char"; break;
                                 default: c_type = "int"; break;
                             }
                             fprintf(gen->header_file, ", %s %s", c_type, field->name);
@@ -648,6 +653,14 @@ const char* get_c_type(Type* type) {
         case TYPE_UINT64: return "uint64_t";
         case TYPE_FLOAT: return "float";
         case TYPE_BOOL: return "int";
+        /* `unsigned char` (not `uint8_t`) so the compiler's strict-aliasing
+         * exemption applies: code may legally read or write any other
+         * type's bytes through an `unsigned char *`. uint8_t is a typedef
+         * of `unsigned char` on most platforms but the C standard does
+         * not require it; using uint8_t* to scrape bytes from another
+         * type's storage is technically a strict-aliasing violation.
+         * `unsigned char` is the right C type for "the octet at this
+         * address" semantics — which is exactly what `byte` means. */
         case TYPE_BYTE: return "unsigned char";
         case TYPE_STRING: return "const char*";
         case TYPE_VOID: return "void";
@@ -665,7 +678,22 @@ const char* get_c_type(Type* type) {
             return buffer;
         }
         case TYPE_MESSAGE: return "Message";
-        case TYPE_PTR: return "void*";
+        case TYPE_PTR: {
+            /* `*StructName` (TYPE_PTR with a TYPE_STRUCT element) renders
+             * as `StructName*` so the C type carries the struct identity
+             * across declarations / parameters / returns. Bare `ptr` (no
+             * element type) stays `void*`. Mirrors the TYPE_ACTOR_REF
+             * shape just below. */
+            if (type->element_type && type->element_type->kind == TYPE_STRUCT &&
+                type->element_type->struct_name) {
+                static char buffers[4][256];
+                static int buf_idx = 0;
+                char* buffer = buffers[buf_idx++ & 3];
+                snprintf(buffer, 256, "%s*", type->element_type->struct_name);
+                return buffer;
+            }
+            return "void*";
+        }
         case TYPE_STRUCT: {
             static char buffers[4][256];
             static int buf_idx = 0;
@@ -1128,6 +1156,24 @@ void generate_program(CodeGenerator* gen, ASTNode* program) {
     print_line(gen, "#include <time.h>");
     print_line(gen, "#include <setjmp.h>");
     print_line(gen, "#include \"aether_panic.h\"");
+    /* Cons-cell sequence type — std.collections.string_seq.
+     *
+     * We include the header unconditionally rather than gating on
+     * "program uses *StringSeq" because:
+     *   1. Detecting use requires walking every type annotation in
+     *      the AST, including transitively-imported externs.
+     *   2. The header is small (one struct + 10 prototypes, only
+     *      <stddef.h> transitively) so the cost of including it
+     *      always is negligible.
+     *   3. The full struct definition is required at the call site
+     *      whenever a `match` arm pattern-matches `[h|t]` against a
+     *      *StringSeq, because the lowered C reads `s->head` /
+     *      `s->tail` directly. A forward decl wouldn't be enough.
+     *   4. The runtime header path is wired via tools/ae.c's -I
+     *      flags (-I.../std/collections), and libaether.a (or the
+     *      from-source fallback build) provides the symbols.
+     */
+    print_line(gen, "#include \"aether_stringseq.h\"");
     print_line(gen, "#ifdef _WIN32");
     print_line(gen, "#define NOMINMAX");
     print_line(gen, "#include <windows.h>");
@@ -1522,6 +1568,20 @@ void generate_program(CodeGenerator* gen, ASTNode* program) {
         gen->builder_func_reg_count++;
     }
 
+    // Forward-declare struct types BEFORE function forward declarations,
+    // so a function signature like `int header_flags(Header*)` resolves
+    // even though the full `typedef struct Header { ... } Header;` is
+    // emitted later (alongside actor / message bodies). Same shape as
+    // the actor forward typedefs at line ~537. Without this, any
+    // function whose param or return type is `*StructName` produces
+    // `unknown type name 'StructName'` at the forward decl site.
+    for (int i = 0; i < program->child_count; i++) {
+        ASTNode* sd = program->children[i];
+        if (sd && sd->type == AST_STRUCT_DEFINITION && sd->value) {
+            fprintf(gen->output, "typedef struct %s %s;\n", sd->value, sd->value);
+        }
+    }
+
     // Generate forward declarations for all functions FIRST so that
     // hoisted closure functions can call them without implicit declarations.
     print_line(gen, "// Forward declarations");
@@ -1656,6 +1716,8 @@ void generate_program(CodeGenerator* gen, ASTNode* program) {
             }
         }
     }
+
+    // (reachable_funcs computed earlier, before the forward-decl loop.)
 
     for (int i = 0; i < program->child_count; i++) {
         ASTNode* child = program->children[i];

@@ -86,6 +86,20 @@ int string_index_of(const void* str, const char* substring);
 int string_index_of_from(const void* str, const char* substring, int start);
 char* string_substring(const void* str, int start, int end);
 
+/* Length-aware sibling — caller supplies the source length explicitly.
+ * Use when `str` arrives as a `string`-typed parameter at a function
+ * boundary (where #297's auto-unwrap may have stripped the
+ * AetherString header) AND the content may contain embedded NULs.
+ * The plain string_substring would call str_len() on the unwrapped
+ * data and fall through to strlen, truncating at the first NUL. */
+char* string_substring_n(const void* str, int str_len_bytes, int start, int end);
+
+/* Identity helper documenting intent: in code that receives a
+ * `string` parameter plus an explicit length, the explicit length
+ * is the truth — don't consult the AetherString header. Pure no-op
+ * at the C level; clamps negative input to 0. */
+int string_length_n(const void* str, int known_length);
+
 // Construct a 1-byte AetherString from a byte code (0..255).
 // Primary use: emitting known single-byte markers (\x01, \x02, etc.)
 // into packed-string record formats without routing through a
@@ -105,6 +119,20 @@ AetherStringArray* string_split(const void* str, const char* delimiter);
 int string_array_size(AetherStringArray* arr);
 const char* string_array_get(AetherStringArray* arr, int index);
 void string_array_free(AetherStringArray* arr);
+
+/* Sibling of `string_split` that returns the result as a cons-cell
+ * `*StringSeq` (see std/collections/aether_stringseq.h). Same split
+ * semantics — empty input gives a single-cell list with "", a delim
+ * longer than the input gives a single-cell list with the whole
+ * input, trailing/leading delimiters yield empty pieces — but the
+ * shape on return is the Erlang-style sequence rather than the
+ * dynamic-array AetherStringArray. Useful when the result will be
+ * pattern-matched, walked recursively, or sent across an actor
+ * boundary as a message field. The returned pointer is a `void*`
+ * to keep this header free of a layering dependency on
+ * aether_stringseq.h; callers cast to `StringSeq*` (or Aether-side
+ * declared as `*StringSeq`). NULL on OOM or NULL inputs. */
+void* string_split_to_seq(const void* str, const char* delimiter);
 
 // Conversion
 const char* string_to_cstr(const void* str);

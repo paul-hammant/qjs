@@ -649,6 +649,41 @@ static int has_ctx_first_param(ASTNode* func) {
     return 0;
 }
 
+/* Returns 1 if `init` is an integer literal whose value is outside
+ * 0..255, which would silently truncate when assigned to a `byte`-
+ * typed slot. Returns 0 if it's in range, not a literal, or not an
+ * integer literal at all (those cases are accepted; runtime
+ * truncation matches how other narrowings behave).
+ *
+ * Catches the obvious typo `b: byte = 256` at compile time per Nic's
+ * pick of option (b): literal-range check + runtime truncate for
+ * non-literal int. */
+static int byte_assignment_literal_out_of_range(ASTNode* init) {
+    if (!init || init->type != AST_LITERAL || !init->value) return 0;
+    if (!init->node_type) return 0;
+    /* Only int / int64 literals get the range check. Float / string /
+     * bool literals fail the type-compatibility check earlier and
+     * never reach here. */
+    if (init->node_type->kind != TYPE_INT && init->node_type->kind != TYPE_INT64) {
+        return 0;
+    }
+    /* Parse the literal text. Aether accepts decimal, hex (0x), octal
+     * (0o), and binary (0b) integer literals. strtoll handles decimal
+     * and 0x out of the box; octal/binary need a lighter touch but
+     * the values for byte-range bounds (0..255) are small enough that
+     * any of these representations is fine to parse. */
+    const char* s = init->value;
+    long long v = 0;
+    if (s[0] == '0' && (s[1] == 'b' || s[1] == 'B')) {
+        v = strtoll(s + 2, NULL, 2);
+    } else if (s[0] == '0' && (s[1] == 'o' || s[1] == 'O')) {
+        v = strtoll(s + 2, NULL, 8);
+    } else {
+        v = strtoll(s, NULL, 0);  /* handles decimal and 0x / 0X */
+    }
+    return (v < 0 || v > 255) ? 1 : 0;
+}
+
 // Type compatibility functions
 int is_type_compatible(Type* from, Type* to) {
     if (!from || !to) return 0;
@@ -691,13 +726,19 @@ int is_type_compatible(Type* from, Type* to) {
     if (from->kind == TYPE_INT && to->kind == TYPE_PTR) return 1;
     if (from->kind == TYPE_PTR && to->kind == TYPE_INT) return 1;
 
-    // byte compatibility
-    if (from->kind == TYPE_BYTE && (to->kind == TYPE_INT || to->kind == TYPE_INT64)) return 1;
-    if (to->kind == TYPE_BYTE && (from->kind == TYPE_INT || from->kind == TYPE_INT64)) return 1;
-
-    // Pointer arithmetic: ptr + int -> ptr
-    if (from->kind == TYPE_PTR && (to->kind == TYPE_INT || to->kind == TYPE_INT64)) return 1;
-    if (to->kind == TYPE_PTR && (from->kind == TYPE_INT || from->kind == TYPE_INT64)) return 1;
+    // byte → int / int64 / float: safe widenings.
+    // Reverse direction (int → byte) is intentionally NOT here — it's
+    // gated at the assignment site so out-of-range integer literals
+    // produce a compile-time error rather than silent truncation.
+    // See `check_byte_assignment_literal_range` in the assignment path.
+    if (from->kind == TYPE_BYTE &&
+        (to->kind == TYPE_INT || to->kind == TYPE_INT64 ||
+         to->kind == TYPE_UINT64 || to->kind == TYPE_FLOAT)) return 1;
+    // int → byte allowed for non-literal int (runtime truncate is the
+    // contract, matching how other narrowings behave). Literal-range
+    // check happens elsewhere.
+    if (from->kind == TYPE_INT && to->kind == TYPE_BYTE) return 1;
+    if (from->kind == TYPE_INT64 && to->kind == TYPE_BYTE) return 1;
 
     return 0;
 }
@@ -735,6 +776,49 @@ Type* infer_type(ASTNode* expr, SymbolTable* table) {
 
         case AST_NULL_LITERAL:
             return create_type(TYPE_PTR);
+
+        case AST_PTR_AS_STRUCT_CAST: {
+            /* `expr as *StructName` — view the operand as a pointer to
+             * StructName. Operand must be ptr-typed. Result is
+             * TYPE_PTR with element_type = TYPE_STRUCT{name}, mirroring
+             * how TYPE_ACTOR_REF carries its underlying struct. The
+             * spelled type at the source level is `*StructName`. */
+            if (!expr->value) return create_type(TYPE_UNKNOWN);
+            if (expr->child_count == 0 || !expr->children[0])
+                return create_type(TYPE_UNKNOWN);
+            Type* operand = infer_type(expr->children[0], table);
+            if (operand) {
+                /* Aether already coerces int<->ptr in places, so we
+                 * accept ptr OR int64 OR int as the operand. anything
+                 * else is a type error (a struct value isn't a ptr;
+                 * neither is a string). */
+                int operand_ok = operand->kind == TYPE_PTR ||
+                                 operand->kind == TYPE_INT ||
+                                 operand->kind == TYPE_INT64 ||
+                                 operand->kind == TYPE_UNKNOWN;
+                free_type(operand);
+                if (!operand_ok) {
+                    type_error("`as *T` cast operand must be a `ptr` value",
+                               expr->line, expr->column);
+                    return create_type(TYPE_UNKNOWN);
+                }
+            }
+            /* Validate the named struct exists. */
+            Symbol* struct_sym = lookup_symbol(table, expr->value);
+            if (!struct_sym || !struct_sym->type ||
+                struct_sym->type->kind != TYPE_STRUCT) {
+                char msg[256];
+                snprintf(msg, sizeof(msg),
+                    "`as *%s` — '%s' is not a struct type", expr->value, expr->value);
+                type_error(msg, expr->line, expr->column);
+                return create_type(TYPE_UNKNOWN);
+            }
+            Type* inner = create_type(TYPE_STRUCT);
+            inner->struct_name = strdup(expr->value);
+            Type* result = create_type(TYPE_PTR);
+            result->element_type = inner;
+            return result;
+        }
 
         case AST_IF_EXPRESSION:
             // Type is the type of the then-branch expression
@@ -851,6 +935,26 @@ Type* infer_type(ASTNode* expr, SymbolTable* table) {
                         }
                     }
                 }
+                // Pointer-to-struct field lookup: `*StructName` field access
+                // resolves through the underlying struct's field list, same
+                // as a value-struct. Only the codegen access mode differs
+                // (`->field` vs `.field`).
+                if (base_type && base_type->kind == TYPE_PTR && base_type->element_type &&
+                    base_type->element_type->kind == TYPE_STRUCT &&
+                    base_type->element_type->struct_name) {
+                    Symbol* struct_sym = lookup_symbol(table, base_type->element_type->struct_name);
+                    if (struct_sym && struct_sym->node) {
+                        ASTNode* struct_def = struct_sym->node;
+                        for (int fi = 0; fi < struct_def->child_count; fi++) {
+                            ASTNode* field = struct_def->children[fi];
+                            if (field && field->value && strcmp(field->value, expr->value) == 0) {
+                                if (field->node_type && field->node_type->kind != TYPE_UNKNOWN)
+                                    return clone_type(field->node_type);
+                                break;
+                            }
+                        }
+                    }
+                }
                 // Actor ref field lookup — look up state declarations in the actor definition
                 if (base_type && base_type->kind == TYPE_ACTOR_REF && base_type->element_type &&
                     base_type->element_type->kind == TYPE_STRUCT && base_type->element_type->struct_name) {
@@ -909,22 +1013,24 @@ Type* infer_binary_type(ASTNode* left, ASTNode* right, AeTokenType operator) {
                 // If either type is unknown (e.g., unresolved parameter), allow it
                 return create_type(TYPE_UNKNOWN);
             }
-
-            // Pointer arithmetic
-            if (operator == TOKEN_PLUS || operator == TOKEN_MINUS) {
-                if (left_type->kind == TYPE_PTR && (right_type->kind == TYPE_INT || right_type->kind == TYPE_INT64)) {
-                    return create_type(TYPE_PTR);
-                }
-                if (operator == TOKEN_PLUS && right_type->kind == TYPE_PTR && (left_type->kind == TYPE_INT || left_type->kind == TYPE_INT64)) {
-                    return create_type(TYPE_PTR);
-                }
-                if (operator == TOKEN_MINUS && left_type->kind == TYPE_PTR && right_type->kind == TYPE_PTR) {
-                    return create_type(TYPE_INT); // ptr - ptr -> int
-                }
-            }
-
             if (left_type->kind == TYPE_FLOAT || right_type->kind == TYPE_FLOAT) {
                 return create_type(TYPE_FLOAT);
+            }
+            // byte arithmetic: byte op byte → byte; mixed byte/int → int
+            // (the wider type wins, matching how int op int64 → int64).
+            // This keeps `b1 + b2` typed as byte for tag-byte / NaN-boxing
+            // patterns while letting `b + 1` widen for general arithmetic.
+            if (left_type->kind == TYPE_BYTE && right_type->kind == TYPE_BYTE) {
+                return create_type(TYPE_BYTE);
+            }
+            if ((left_type->kind == TYPE_BYTE || right_type->kind == TYPE_BYTE) &&
+                (left_type->kind == TYPE_INT || left_type->kind == TYPE_INT64 ||
+                 right_type->kind == TYPE_INT || right_type->kind == TYPE_INT64)) {
+                /* Pick the wider int side */
+                if (left_type->kind == TYPE_INT64 || right_type->kind == TYPE_INT64) {
+                    return create_type(TYPE_INT64);
+                }
+                return create_type(TYPE_INT);
             }
             if (left_type->kind == TYPE_INT && right_type->kind == TYPE_INT) {
                 return create_type(TYPE_INT);
@@ -953,6 +1059,21 @@ Type* infer_binary_type(ASTNode* left, ASTNode* right, AeTokenType operator) {
             // Bitwise operations: integer operands, result matches wider type
             if (left_type->kind == TYPE_UNKNOWN || right_type->kind == TYPE_UNKNOWN) {
                 return create_type(TYPE_UNKNOWN);
+            }
+            // byte op byte → byte. NaN-boxing / packed-tag code does
+            // `tag & 0x07`, `flags | 0x80`, etc. — keeping the result
+            // typed `byte` lets the value flow back into a `byte` field
+            // without an explicit narrowing.
+            if (left_type->kind == TYPE_BYTE && right_type->kind == TYPE_BYTE) {
+                return create_type(TYPE_BYTE);
+            }
+            if ((left_type->kind == TYPE_BYTE || right_type->kind == TYPE_BYTE) &&
+                (left_type->kind == TYPE_INT || left_type->kind == TYPE_INT64 ||
+                 right_type->kind == TYPE_INT || right_type->kind == TYPE_INT64)) {
+                if (left_type->kind == TYPE_INT64 || right_type->kind == TYPE_INT64) {
+                    return create_type(TYPE_INT64);
+                }
+                return create_type(TYPE_INT);
             }
             if (left_type->kind == TYPE_INT && right_type->kind == TYPE_INT) {
                 return create_type(TYPE_INT);
@@ -1830,7 +1951,23 @@ static void typecheck_message_constructor(ASTNode* constructor, SymbolTable* tab
         typecheck_expression(value_expr, table);
         Type* actual = infer_type(value_expr, table);
 
-        if (actual && actual->kind != TYPE_UNKNOWN &&
+        /* Cons-cell context: when the declared field type is
+         * `*StringSeq` and the RHS is an array literal, accept the
+         * assignment and stamp the literal's node_type to *StringSeq.
+         * The codegen branch in emit_message_field_init / AST_ARRAY_LITERAL
+         * picks up the stamped type and emits a cons chain instead of
+         * a static C array initialiser. Same disambiguation rule the
+         * variable-decl path uses, lifted to message-field context.
+         * See codegen_expr.c emit_message_field_init for the
+         * matching codegen branch. */
+        int seq_literal_match =
+            value_expr && value_expr->type == AST_ARRAY_LITERAL &&
+            is_string_seq_ptr_type(declared);
+
+        if (seq_literal_match) {
+            if (value_expr->node_type) free_type(value_expr->node_type);
+            value_expr->node_type = clone_type(declared);
+        } else if (actual && actual->kind != TYPE_UNKNOWN &&
             declared->kind != TYPE_UNKNOWN &&
             !is_type_compatible(actual, declared)) {
             char buf[256];
@@ -2086,6 +2223,42 @@ int typecheck_statement(ASTNode* stmt, SymbolTable* table) {
                 }
                 Type* init_type = infer_type(init, table);
 
+                /* Python-style "redeclaration" (`b = 999` after a prior
+                 * `byte b = 0`) parses as a fresh AST_VARIABLE_DECLARATION
+                 * with stmt->node_type == TYPE_UNKNOWN. The variable's
+                 * actual type lives in the symbol table. When the existing
+                 * binding is byte-typed, run the literal-range check
+                 * before stmt->node_type gets overwritten with the int
+                 * init type below. */
+                Symbol* existing = stmt->value ? lookup_symbol(table, stmt->value) : NULL;
+                if (existing && existing->type && existing->type->kind == TYPE_BYTE &&
+                    byte_assignment_literal_out_of_range(init)) {
+                    char msg[256];
+                    snprintf(msg, sizeof(msg),
+                        "byte literal out of range: %s does not fit in 0..255",
+                        init->value ? init->value : "?");
+                    type_error(msg, stmt->line, stmt->column);
+                    free_type(init_type);
+                    return 0;
+                }
+
+                /* Context-sensitive literal: `[a, b, c]` against a
+                 * `*StringSeq`-typed variable means "build a cons chain"
+                 * rather than "build a static C array". Stamp the
+                 * literal's node_type so the codegen branch in
+                 * codegen_expr.c picks the cons-chain emitter. The
+                 * empty literal `[]` carries through as a *StringSeq
+                 * NULL the same way. See std/collections/aether_stringseq.h
+                 * for the cell layout. */
+                if (init->type == AST_ARRAY_LITERAL &&
+                    is_string_seq_ptr_type(stmt->node_type)) {
+                    if (init->node_type) free_type(init->node_type);
+                    init->node_type = clone_type(stmt->node_type);
+                    free_type(init_type);
+                    add_symbol(table, stmt->value, clone_type(stmt->node_type), 0, 0, 0);
+                    return 1;
+                }
+
                 // If variable has no explicit type (TYPE_UNKNOWN), use initializer's type
                 if (!stmt->node_type || stmt->node_type->kind == TYPE_UNKNOWN) {
                     if (stmt->node_type) free_type(stmt->node_type);
@@ -2094,6 +2267,20 @@ int typecheck_statement(ASTNode* stmt, SymbolTable* table) {
                     // Has explicit type but initializer doesn't match
                     free_type(init_type);
                     type_error("Type mismatch in variable initialization", stmt->line, stmt->column);
+                    return 0;
+                }
+                /* `byte b = <int literal>` — fresh declaration with explicit
+                 * `byte` type. Reject out-of-range literals at compile time
+                 * per Nic's option (b). Non-literal int is accepted (runtime
+                 * truncation, matching int64→int etc.). */
+                if (stmt->node_type && stmt->node_type->kind == TYPE_BYTE &&
+                    byte_assignment_literal_out_of_range(init)) {
+                    char msg[256];
+                    snprintf(msg, sizeof(msg),
+                        "byte literal out of range: %s does not fit in 0..255",
+                        init->value ? init->value : "?");
+                    type_error(msg, stmt->line, stmt->column);
+                    free_type(init_type);
                     return 0;
                 }
                 free_type(init_type);
@@ -2132,6 +2319,18 @@ int typecheck_statement(ASTNode* stmt, SymbolTable* table) {
                              type_name(symbol->type), type_name(right_type));
                     free_type(right_type);
                     type_error(error_msg, stmt->line, stmt->column);
+                    return 0;
+                }
+                /* `b = <int literal>` where b: byte — same range check as the
+                 * declaration path. */
+                if (symbol->type && symbol->type->kind == TYPE_BYTE &&
+                    byte_assignment_literal_out_of_range(right)) {
+                    char msg[256];
+                    snprintf(msg, sizeof(msg),
+                        "byte literal out of range: %s does not fit in 0..255",
+                        right->value ? right->value : "?");
+                    type_error(msg, stmt->line, stmt->column);
+                    free_type(right_type);
                     return 0;
                 }
                 free_type(right_type);
@@ -2447,12 +2646,23 @@ int typecheck_statement(ASTNode* stmt, SymbolTable* table) {
             // Type check the match expression
             Type* match_expr_type = NULL;
             Type* element_type = NULL;
+            /* Whether the match expression is a `*StringSeq`. When it
+             * is, head bindings are typed `string` and tail bindings
+             * are typed `*StringSeq` (so recursive walks compose) —
+             * not the array-element + array-of-element shapes used
+             * for the legacy int-array path. See codegen_stmt.c
+             * `is_string_seq_type` for the matching codegen
+             * dispatch. */
+            int is_seq_match = 0;
             if (stmt->child_count > 0) {
                 typecheck_expression(stmt->children[0], table);
                 match_expr_type = stmt->children[0]->node_type;
                 // Extract element type if matching on an array
                 if (match_expr_type && match_expr_type->kind == TYPE_ARRAY && match_expr_type->element_type) {
                     element_type = match_expr_type->element_type;
+                } else if (is_string_seq_ptr_type(match_expr_type)) {
+                    is_seq_match = 1;
+                    element_type = create_type(TYPE_STRING);
                 }
             }
             // Default to int if we couldn't determine the element type
@@ -2490,8 +2700,19 @@ int typecheck_statement(ASTNode* stmt, SymbolTable* table) {
                     if (pattern->child_count >= 2) {
                         ASTNode* tail = pattern->children[1];
                         if (tail && tail->type == AST_PATTERN_VARIABLE && tail->value) {
-                            Type* tail_type = create_type(TYPE_ARRAY);
-                            tail_type->element_type = clone_type(element_type);
+                            Type* tail_type;
+                            if (is_seq_match) {
+                                /* tail in `[h|t]` against a `*StringSeq`
+                                 * is itself a `*StringSeq`, not an
+                                 * array-of-element. This is what makes
+                                 * recursive walks compose: walk(tail)
+                                 * passes a properly-typed seq into the
+                                 * recursive call. */
+                                tail_type = make_string_seq_ptr_type();
+                            } else {
+                                tail_type = create_type(TYPE_ARRAY);
+                                tail_type->element_type = clone_type(element_type);
+                            }
                             add_symbol(arm_table, tail->value, tail_type, 0, 0, 0);
                         }
                     }
@@ -2582,6 +2803,18 @@ int typecheck_expression(ASTNode* expr, SymbolTable* table) {
             if (!expr->node_type) expr->node_type = create_type(TYPE_PTR);
             return 1;
 
+        case AST_PTR_AS_STRUCT_CAST:
+            /* Walk the operand, then set our own node_type via the
+             * shared inference path so codegen sees the
+             * TYPE_PTR{element=TYPE_STRUCT} on this node and emits
+             * `->field` for downstream member access. */
+            if (expr->child_count > 0) {
+                typecheck_expression(expr->children[0], table);
+            }
+            if (expr->node_type) free_type(expr->node_type);
+            expr->node_type = infer_type(expr, table);
+            return 1;
+
         case AST_ARRAY_LITERAL:
             // Type check all array elements
             for (int i = 0; i < expr->child_count; i++) {
@@ -2663,17 +2896,6 @@ int typecheck_expression(ASTNode* expr, SymbolTable* table) {
             if (expr->child_count >= 2) {
                 typecheck_expression(expr->children[0], table);
                 typecheck_expression(expr->children[1], table);
-
-                Type* base_type = infer_type(expr->children[0], table);
-                if (base_type && base_type->kind == TYPE_PTR) {
-                    // Enable indexing on ptr types, default to byte access
-                    if (!expr->node_type || expr->node_type->kind == TYPE_UNKNOWN) {
-                        if (expr->node_type) free_type(expr->node_type);
-                        expr->node_type = create_type(TYPE_BYTE);
-                    }
-                }
-                if (base_type) free_type(base_type);
-
                 Type* idx_type = infer_type(expr->children[1], table);
                 if (idx_type && idx_type->kind != TYPE_INT && idx_type->kind != TYPE_INT64
                     && idx_type->kind != TYPE_UNKNOWN) {
@@ -2744,8 +2966,7 @@ int typecheck_expression(ASTNode* expr, SymbolTable* table) {
 
                 // Reject member access on primitive types — catch the error in Aether, not C
                 if (base_type && (base_type->kind == TYPE_INT || base_type->kind == TYPE_FLOAT ||
-                                  base_type->kind == TYPE_BOOL || base_type->kind == TYPE_BYTE ||
-                                  base_type->kind == TYPE_STRING)) {
+                                  base_type->kind == TYPE_BOOL || base_type->kind == TYPE_STRING)) {
                     char error_msg[256];
                     snprintf(error_msg, sizeof(error_msg),
                              "Type '%s' has no field '%s'",
@@ -2895,6 +3116,21 @@ int typecheck_binary_expression(ASTNode* expr, SymbolTable* table) {
             free_type(left_type);
             free_type(right_type);
             type_error("Type mismatch in assignment", expr->line, expr->column);
+            return 0;
+        }
+        /* `b = <int literal>` where b: byte — same range check as the
+         * declaration / AST_ASSIGNMENT paths. The plain `=` operator
+         * parses as AST_BINARY_EXPRESSION, so we need the check here
+         * too. */
+        if (left_type && left_type->kind == TYPE_BYTE &&
+            byte_assignment_literal_out_of_range(right)) {
+            char msg[256];
+            snprintf(msg, sizeof(msg),
+                "byte literal out of range: %s does not fit in 0..255",
+                right->value ? right->value : "?");
+            type_error(msg, expr->line, expr->column);
+            free_type(left_type);
+            free_type(right_type);
             return 0;
         }
         expr->node_type = clone_type(left_type);

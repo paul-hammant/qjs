@@ -39,9 +39,38 @@ Aether is a statically-typed, compiled language combining Erlang-inspired actor 
 | `float` | 64-bit floating point | `3.14`, `-0.5` |
 | `string` | UTF-8 encoded strings | `"Hello"` |
 | `bool` | Boolean type | `true`, `false` |
+| `byte` | Unsigned 8-bit (0..255) | `byte b = 0xFF` |
 | `void` | No value (for functions) | - |
 | `long` | 64-bit signed integer | `long x = 0` |
 | `ptr` | Raw pointer (for C interop) | `null` |
+
+#### `byte` — unsigned 8-bit
+
+The `byte` type maps to `unsigned char` in C. Use it for type-precision in struct fields, function parameters, returns, and locals where a value is genuinely an octet — packed-tag bytes (`flags & 0x80`), opcode discriminators, NaN-boxing pointer tags, network protocol headers, on-disk file format fields. For *bulk* byte storage (binary buffers, byte arrays), reach for `std.bytes` (the mutable byte buffer) instead.
+
+```aether
+struct OpCode {
+    byte op
+    byte flags
+    int  imm
+}
+
+set_tag(t: byte) -> byte {
+    return t & 0x7F     // bitwise byte op byte → byte
+}
+
+main() {
+    byte b = 0xA5
+    byte high = b & 0xF0    // stays byte
+    n = b + 1               // byte + int → int (promotes)
+}
+```
+
+**Range check on integer literals.** Assigning an out-of-range integer literal to a `byte` slot is a compile-time error: `byte b = 256` is rejected. Non-literal int → byte assignments compile and truncate at runtime (`byte b = some_int` keeps the low 8 bits), matching how other narrowings (`int64 → int`) behave.
+
+**Arithmetic.** `byte op byte → byte`; mixed `byte op int → int` (the wider type wins). This keeps NaN-boxing / packed-tag patterns expressible (`tag & 0x07` stays a byte) while letting general arithmetic widen naturally.
+
+**C-side mapping.** `byte` lowers to `unsigned char` in the generated C, not `uint8_t`. The two are typedef-compatible on most platforms but C's strict-aliasing rules give `unsigned char *` an exemption (it can alias *any* type for read/write); `uint8_t *` does not. Since `byte` is exactly the type used to inspect the bytes of other types' storage, `unsigned char` is the right choice.
 
 ### Composite Types
 
@@ -59,6 +88,32 @@ int[10] numbers;           // Array of 10 integers
 string[5] names;           // Array of 5 strings
 float[100] values;         // Array of 100 floats
 ```
+
+### Sequence Types (`*StringSeq`)
+
+`*StringSeq` is a cons-cell linked list of strings — Erlang/Elixir-shaped, with O(1) head/tail/cons/length and refcount-based structural sharing. Empty list is the `NULL` pointer; each cell carries a cached length.
+
+```aether
+import std.string
+
+main() {
+    s = string.seq_empty()
+    s = string.seq_cons("c", s)
+    s = string.seq_cons("b", s)
+    s = string.seq_cons("a", s)        // s = a -> b -> c
+    println(string.seq_length(s))       // 3 (O(1))
+
+    // Pattern-match destructure works directly:
+    match s {
+        []      -> { /* end */ }
+        [h | t] -> { println(h); /* h: string, t: *StringSeq */ }
+    }
+
+    string.seq_free(s)
+}
+```
+
+The full surface lives in `std.string` (alongside `string.array_*` for the legacy `AetherStringArray` shape). See [sequences.md](sequences.md) for the worked examples and the literal-disambiguation rule (`[a, b, c]` builds a cons chain when the target type is `*StringSeq`, vs a static C array when the target is `string[]`).
 
 ### Numeric Literal Formats
 
@@ -729,6 +784,40 @@ struct Config {
     float threshold
 }
 ```
+
+### Pointer-to-struct type — `*StructName` and `expr as *StructName`
+
+For systems-programming code that overlays a struct header on a raw `ptr` (e.g. linked-list nodes in C-allocated memory, on-disk file headers read into a buffer), Aether has a first-class pointer-to-struct type spelled `*StructName` and a postfix `as` cast operator that produces a value of that type:
+
+```aether
+extern malloc(size: int) -> ptr
+extern free(p: ptr)
+
+struct ListHead {
+    next: ptr
+    prev: ptr
+    flags: int
+}
+
+// `*ListHead` is usable in any type position — params, returns,
+// struct fields, locals.
+init_head(h: *ListHead) {
+    h.next  = 0
+    h.prev  = 0
+    h.flags = 1
+}
+
+main() {
+    raw  = malloc(64)
+    head = raw as *ListHead    // type of head is *ListHead
+    init_head(head)
+    free(raw)
+}
+```
+
+The cast is a view, not an allocation — the operand pointer's lifetime is the caller's problem (the same contract as raw `extern` interaction). Reach for this only when the storage is C-allocated and Aether wants to manipulate fields. For Aether-owned data, use the normal struct-literal form (`Point { x: 1, y: 2 }`) so refcounting and lifetime tracking apply.
+
+The `as` keyword is the same token used for `import x as y` aliasing; the two parses don't collide because import-aliasing is recognised only inside `import` statements. Full semantics (operand type rules, error cases, the shared-token interaction) are in [c-interop.md § Struct overlay on raw pointers](c-interop.md#struct-overlay-on-raw-pointers--structname-and-expr-as-structname).
 
 ---
 

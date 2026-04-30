@@ -55,7 +55,6 @@ Token* advance_token(Parser* parser) {
 // TOKEN_IDENTIFIER itself and anything whose value is punctuation.
 static int token_is_reserved_keyword(Token* token) {
     if (!token || !token->value || token->type == TOKEN_IDENTIFIER) return 0;
-    if (token->type == TOKEN_BYTE || token->type == TOKEN_PTR) return 0;
     const char* s = token->value;
     if (!((*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z') || *s == '_')) return 0;
     for (const char* p = s + 1; *p; p++) {
@@ -141,6 +140,27 @@ Type* parse_type(Parser* parser) {
     if (!token) return NULL;
 
     Type* type = NULL;
+
+    // Pointer-to-struct type: `*StructName`. Lowers to `StructName*` in
+    // C. Used as the return type of `expr as *StructName` (the
+    // pointer-overlay cast) and accepted in any other type position
+    // (variable annotations, function params, return types, struct
+    // fields, extern decls). The pointer-ness is part of the spelled
+    // type so callers can declare e.g. `process(node: *list_head)`.
+    // Plain `ptr` (void*) remains the right type for raw byte addresses;
+    // `*T` carries the struct identity through the type system so member
+    // access dispatches via `->field` automatically. Lifetime is the
+    // operand's — `as` does not allocate or refcount.
+    if (token->type == TOKEN_MULTIPLY) {
+        advance_token(parser);
+        Token* name_tok = expect_token(parser, TOKEN_IDENTIFIER);
+        if (!name_tok) return NULL;
+        Type* struct_type = create_type(TYPE_STRUCT);
+        struct_type->struct_name = strdup(name_tok->value);
+        Type* ptr_type = create_type(TYPE_PTR);
+        ptr_type->element_type = struct_type;
+        return ptr_type;
+    }
 
     // Tuple type: `(T1, T2, ...)` — used in extern return positions for
     // C functions that return a struct by value with the matching shape.
@@ -512,9 +532,7 @@ ASTNode* parse_primary_expression(Parser* parser) {
         case TOKEN_STRING:
         case TOKEN_INT:
         case TOKEN_FLOAT:
-        case TOKEN_BOOL:
-        case TOKEN_BYTE:
-        case TOKEN_PTR: {
+        case TOKEN_BOOL: {
             // Check if followed by dot - treat as namespace identifier
             Token* next = peek_ahead(parser, 1);
             if (next && next->type == TOKEN_DOT) {
@@ -864,11 +882,38 @@ static ASTNode* parse_postfix_expression(Parser* parser) {
             ASTNode* index = parse_expression(parser);
             if (!index) return NULL;
             if (!expect_token(parser, TOKEN_RIGHT_BRACKET)) return NULL;
-            
+
             ASTNode* array_access = create_ast_node(AST_ARRAY_ACCESS, NULL, op->line, op->column);
             add_child(array_access, expr);  // array expression
             add_child(array_access, index); // index expression
             expr = array_access;
+            continue;
+        }
+
+        if (op->type == TOKEN_AS) {
+            // Pointer-overlay struct cast: `expr as *StructName`
+            // Views a raw `ptr`-typed value as a pointer-to-struct so
+            // member access (`view.field`) can reach struct fields. The
+            // `ptr` operand's lifetime is the caller's problem — the
+            // cast does NOT allocate, refcount, or auto-free. This is
+            // the systems-programming escape hatch for FFI shapes that
+            // overlay struct headers on raw memory (e.g. QuickJS-style
+            // tagged-pointer ports). The leading `*` makes the
+            // pointer-ness visible in source; the result type is
+            // spelled `*StructName` and matches type annotations on
+            // function parameters, struct fields, etc. The keyword
+            // token TOKEN_AS is shared with `import x as y` aliasing;
+            // that's parsed only inside import statements so there's
+            // no collision.
+            advance_token(parser);  /* consume `as` */
+            if (!expect_token(parser, TOKEN_MULTIPLY)) return NULL;
+            Token* struct_name_tok = expect_token(parser, TOKEN_IDENTIFIER);
+            if (!struct_name_tok) return NULL;
+            ASTNode* cast = create_ast_node(AST_PTR_AS_STRUCT_CAST,
+                                            struct_name_tok->value,
+                                            op->line, op->column);
+            add_child(cast, expr);
+            expr = cast;
             continue;
         }
         
@@ -929,7 +974,18 @@ static ASTNode* parse_postfix_expression(Parser* parser) {
                     return NULL;
                 }
             }
-            
+
+            // Capture the closing paren's line for the trailing-block
+            // line check below. Both arg-list paths (empty via
+            // match_token at the head of the surrounding if; non-empty
+            // via expect_token after the do/while) have just consumed
+            // the `)`, so it sits at parser->current_token - 1. See #286:
+            // a `{` on a later line must NOT be eaten as a trailing
+            // closure for this call — it is a separate bare-brace block.
+            int paren_close_line = (parser->current_token > 0)
+                ? parser->tokens[parser->current_token - 1]->line
+                : -1;
+
             // Check for trailing closure/block after function call
             // func(args) { body }  or  func(args) |x| { body }
             // func(args) callback { body }  or  func(args) callback |x| { body }
@@ -964,21 +1020,52 @@ static ASTNode* parse_postfix_expression(Parser* parser) {
                         add_child(func_call, trailing);
                     }
                 } else if (next_tok && next_tok->type == TOKEN_LEFT_BRACE &&
-                           !parser->in_condition) {
+                           !parser->in_condition &&
+                           next_tok->line == paren_close_line) {
                     // Trailing block without params: func(args) { body }
                     //
-                    // Suppressed when we're parsing an if/while/for condition:
-                    // the `{` there is the start of the statement's body, not
-                    // a trailing closure attached to the rightmost call. Eating
-                    // it here would swallow the real body and produce silently
-                    // wrong code (e.g. an infinite while loop because the
-                    // increment statement becomes the if-body).
+                    // Only attached when `{` is on the same source line as
+                    // the call's closing `)`. A `{` on a later line is a
+                    // separate bare-brace block (handled by the statement
+                    // parser via TOKEN_LEFT_BRACE → parse_block). See #286
+                    // and docs/closures-and-builder-dsl.md § Same-line rule
+                    // for trailing blocks.
+                    //
+                    // Also suppressed when we're parsing an if/while/for
+                    // condition: the `{` there is the start of the
+                    // statement's body, not a trailing closure attached to
+                    // the rightmost call. Eating it here would swallow the
+                    // real body and produce silently wrong code (e.g. an
+                    // infinite while loop because the increment statement
+                    // becomes the if-body).
                     ASTNode* trailing = create_ast_node(AST_CLOSURE, "trailing",
                                                          next_tok->line, next_tok->column);
                     trailing->node_type = create_type(TYPE_FUNCTION);
                     ASTNode* body = parse_block(parser);
                     add_child(trailing, body);
                     add_child(func_call, trailing);
+                } else if (next_tok && next_tok->type == TOKEN_LEFT_BRACE &&
+                           !parser->in_condition &&
+                           next_tok->line > paren_close_line) {
+                    // Common foot-gun (#286): user wrote
+                    //     x = call()
+                    //     {
+                    //         ...
+                    //     }
+                    // and likely either (a) intended a trailing closure
+                    // and put `{` on the wrong line, or (b) intended a
+                    // separate bare-brace block. Under the same-line
+                    // rule we keep the safe interpretation — leave the
+                    // `{` for the statement parser, which will treat it
+                    // as a bare block — and emit a hint so users in case
+                    // (a) get pointed at the fix without having to debug
+                    // an "Undefined variable" later.
+                    AetherError w = {NULL, NULL, next_tok->line, next_tok->column,
+                        "'{' on this line is parsed as a separate block, not as a trailing closure for the preceding call",
+                        "move '{' to the same line as the closing ')' if you intended a trailing closure",
+                        NULL, AETHER_ERR_NONE};
+                    aether_warning_report(&w);
+                    /* fall through — leave the `{` for the statement parser */
                 }
             }
 
@@ -1158,8 +1245,7 @@ ASTNode* parse_statement(Parser* parser) {
         case TOKEN_STRING:
         case TOKEN_FLOAT:
         case TOKEN_BOOL:
-        case TOKEN_BYTE:
-        case TOKEN_PTR: {
+        case TOKEN_BYTE: {
             // Check if this is a namespace call: string.func() vs type declaration: string x = ...
             Token* next = peek_ahead(parser, 1);
             if (next && next->type == TOKEN_DOT) {
@@ -1173,7 +1259,7 @@ ASTNode* parse_statement(Parser* parser) {
                 }
                 return NULL;
             }
-            // Explicit type declaration: int x = 42;
+            // Explicit type declaration: int x = 42;  byte b = 0x7F;
             return parse_variable_declaration(parser);
         }
             
@@ -1484,7 +1570,8 @@ ASTNode* parse_for_loop(Parser* parser) {
 
     // Check if init is a variable declaration (int i = 1) or expression (i = 1)
     if (token && (token->type == TOKEN_INT || token->type == TOKEN_STRING ||
-                  token->type == TOKEN_FLOAT || token->type == TOKEN_BOOL)) {
+                  token->type == TOKEN_FLOAT || token->type == TOKEN_BOOL ||
+                  token->type == TOKEN_BYTE)) {
         init = parse_variable_declaration_with_semicolon(parser, false);
         match_token(parser, TOKEN_SEMICOLON);
     } else if (token && token->type == TOKEN_IDENTIFIER) {
@@ -1794,6 +1881,7 @@ static int is_module_name_token(Token* token) {
         case TOKEN_INT:     // 'int' keyword
         case TOKEN_FLOAT:   // 'float' keyword
         case TOKEN_BOOL:    // 'bool' keyword
+        case TOKEN_BYTE:    // 'byte' keyword
             return 1;
         default:
             return 0;
@@ -2413,7 +2501,8 @@ ASTNode* parse_actor_definition(Parser* parser) {
             
             if (next_tok && (next_tok->type == TOKEN_INT || next_tok->type == TOKEN_INT64 ||
                             next_tok->type == TOKEN_FLOAT ||
-                            next_tok->type == TOKEN_STRING || next_tok->type == TOKEN_BOOL)) {
+                            next_tok->type == TOKEN_STRING || next_tok->type == TOKEN_BOOL ||
+                            next_tok->type == TOKEN_BYTE)) {
                 // Explicit type: state int count = 0  or  state long total = 0
                 state_decl = parse_variable_declaration_with_semicolon(parser, false);
             } else if (next_tok && next_tok->type == TOKEN_IDENTIFIER) {
@@ -3095,6 +3184,7 @@ ASTNode* parse_struct_definition(Parser* parser) {
         Type* c_type = NULL;
         if (peek && (peek->type == TOKEN_INT  || peek->type == TOKEN_INT64 ||
                      peek->type == TOKEN_FLOAT || peek->type == TOKEN_BOOL  ||
+                     peek->type == TOKEN_BYTE  ||
                      peek->type == TOKEN_STRING || peek->type == TOKEN_PTR)) {
             Token* ahead = peek_ahead(parser, 1);
             if (ahead && ahead->type == TOKEN_IDENTIFIER) {

@@ -169,7 +169,7 @@ STD_SRC = std/string/aether_string.c std/math/aether_math.c std/net/aether_http.
 # because aetherc does not link the runtime scheduler, but included in
 # libaether.a and user programs where the runtime is present.
 STD_REACTOR_SRC = std/net/aether_actor_bridge.c
-COLLECTIONS_SRC = std/collections/aether_hashmap.c std/collections/aether_set.c std/collections/aether_vector.c std/collections/aether_pqueue.c std/collections/aether_intarr.c std/collections/aether_stringlist.c
+COLLECTIONS_SRC = std/collections/aether_hashmap.c std/collections/aether_set.c std/collections/aether_vector.c std/collections/aether_pqueue.c std/collections/aether_intarr.c std/collections/aether_stringlist.c std/collections/aether_stringseq.c
 
 # I/O poller backends (needed by both compiler and runtime targets)
 IO_POLLER_SRC = runtime/scheduler/aether_io_poller_epoll.c runtime/scheduler/aether_io_poller_kqueue.c runtime/scheduler/aether_io_poller_poll.c
@@ -280,29 +280,35 @@ test-fast: compiler-fast
 	./build/test_runner$(EXE_EXT)
 
 # test-valgrind / test-asan / test-memory: link the test runner's own
-# main() from TEST_SRC together with the compiler-as-library sources.
-# Must use COMPILER_LIB_SRC (no aetherc.c) — linking COMPILER_SRC here
-# pulls in aetherc's main() and collides with test_main.c's main().
-# The test-fast target at line ~275 is the reference pattern.
-test-valgrind: compiler
+# main() from TEST_SRC against pre-built flavoured archives instead of
+# recompiling the full stdlib + compiler-lib sources every invocation.
+# Each archive bakes the right instrumentation in once (asan, memory
+# tracking, or -O0 -g for valgrind). See `stdlib-{asan,memory,dbg}`
+# rules above. The archives must use COMPILER_LIB_SRC (no aetherc.c)
+# so test_main.c's main() doesn't collide with aetherc's.
+test-valgrind: compiler stdlib-dbg
 	@echo "==================================="
 	@echo "Running Tests with Valgrind"
 	@echo "==================================="
-	$(CC) $(CFLAGS) -O0 -g $(TEST_SRC) $(COMPILER_LIB_SRC) $(RUNTIME_SRC) $(STD_SRC) $(STD_REACTOR_SRC) $(COLLECTIONS_SRC) -Icompiler -Istd -Istd/collections -o build/test_runner$(EXE_EXT) $(LDFLAGS)
+	$(CC) $(CFLAGS_NO_OPT) $(DBG_OPT) $(TEST_SRC) build/dbg/libaether_compiler.a build/dbg/libaether.a -Icompiler -Istd -Istd/collections -o build/test_runner$(EXE_EXT) $(LDFLAGS)
 	valgrind --leak-check=full --show-leak-kinds=all --track-origins=yes --error-exitcode=1 ./build/test_runner$(EXE_EXT)
 
-test-asan: compiler
+test-asan: compiler stdlib-asan
 	@echo "==================================="
 	@echo "Running Tests with AddressSanitizer"
 	@echo "==================================="
-	$(CC) -fsanitize=address -fsanitize=leak -fno-omit-frame-pointer -O1 -g $(TEST_SRC) $(COMPILER_LIB_SRC) $(RUNTIME_SRC) $(STD_SRC) $(STD_REACTOR_SRC) $(COLLECTIONS_SRC) -Icompiler -Istd -Istd/collections -o build/test_runner_asan$(EXE_EXT) $(LDFLAGS) -lpthread -lm
+	$(CC) $(CFLAGS_NO_OPT) $(ASAN_OPT) $(ASAN_FLAGS) $(TEST_SRC) build/asan/libaether_compiler.a build/asan/libaether.a -Icompiler -Istd -Istd/collections -o build/test_runner_asan$(EXE_EXT) $(LDFLAGS)
+ifeq ($(shell uname -s),Linux)
 	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 ./build/test_runner_asan$(EXE_EXT)
+else
+	ASAN_OPTIONS=halt_on_error=1 ./build/test_runner_asan$(EXE_EXT)
+endif
 
-test-memory: compiler
+test-memory: compiler stdlib-memory
 	@echo "==================================="
 	@echo "Running Memory Tracking Tests"
 	@echo "==================================="
-	$(CC) $(CFLAGS) -DAETHER_MEMORY_TRACKING $(TEST_SRC) $(COMPILER_LIB_SRC) $(RUNTIME_SRC) $(STD_SRC) $(STD_REACTOR_SRC) $(COLLECTIONS_SRC) -Icompiler -Istd -Istd/collections -o build/test_runner_mem$(EXE_EXT) $(LDFLAGS)
+	$(CC) $(CFLAGS) $(MEM_FLAGS) $(TEST_SRC) build/memory/libaether_compiler.a build/memory/libaether.a -Icompiler -Istd -Istd/collections -o build/test_runner_mem$(EXE_EXT) $(LDFLAGS)
 	./build/test_runner_mem$(EXE_EXT)
 
 test-manual-runtime: compiler
@@ -355,7 +361,7 @@ test-ae: compiler ae stdlib
 	printf 'fi\n'                                                                                   >> "$$script"; \
 	chmod +x "$$script"; \
 	root=$$(pwd); \
-	find tests/syntax tests/compiler tests/integration tests/regression -path '*/lib/*' -prune -o -path '*/custom_lib_dir/*' -prune -o -path 'tests/integration/namespace_*' -prune -o -path 'tests/integration/closure_actor_state_reject/*' -prune -o -path 'tests/integration/reserved_keyword_error/*' -prune -o -path 'tests/integration/ae_run_cflags/*' -prune -o -path 'tests/integration/bin_path_match/*' -prune -o -path 'tests/integration/bin_name_lookup_and_walkup/*' -prune -o -path 'tests/integration/string_plus_reject/*' -prune -o -path 'tests/integration/aether_string_to_c_extern/*' -prune -o -path 'tests/integration/http_external_ptr/*' -prune -o -path 'tests/integration/fs_read_binary_nul/*' -prune -o -path 'tests/integration/fs_write_binary_nul/*' -prune -o -path 'tests/integration/cryptography_sha/*' -prune -o -path 'tests/integration/cryptography_v2/*' -prune -o -path 'tests/integration/extern_annotation/*' -prune -o -path 'tests/integration/c_callback/*' -prune -o -path 'tests/integration/extern_tuple_return/*' -prune -o -path 'tests/integration/sqlite_roundtrip/*' -prune -o -path 'tests/integration/sqlite_prepared/*' -prune -o -path 'tests/integration/zlib_roundtrip/*' -prune -o -path 'tests/integration/aether_string_ffi_unwrap/*' -prune -o -path 'tests/integration/ptr_return_int_zero_inference/*' -prune -o -path 'tests/integration/string_interp_loop_alias/*' -prune -o -path 'tests/integration/transitive_module_import/*' -prune -o -path 'tests/integration/http_client_redirects/*' -prune -o -path 'tests/integration/source_location/*' -prune -o -path 'tests/integration/std_dl/*' -prune -o -path 'tests/integration/host_tinygo/*' -prune -o -path 'tests/integration/sealed_namespaces/*' -prune -o -path 'tests/integration/default_arguments/*' -prune -o -path 'tests/integration/source_location_default_capture/*' -prune -o -path 'tests/integration/fn_typed_local_call/*' -prune -o -path 'tests/integration/http_server_tls/*' -prune -o -path 'tests/integration/http_server_keepalive/*' -prune -o -path 'tests/integration/http_server_actor_dispatch/*' -prune -o -path 'tests/integration/http_middleware_d1/*' -prune -o -path 'tests/integration/http_middleware_d2/*' -prune -o -path 'tests/integration/http_server_ops/*' -prune -o -path 'tests/integration/http_server_observability/*' -prune -o -path 'tests/integration/http_server_sse/*' -prune -o -path 'tests/integration/http_server_websocket/*' -prune -o -name '*.ae' -print 2>/dev/null | sort | \
+	find tests/syntax tests/compiler tests/integration tests/regression -path '*/lib/*' -prune -o -path '*/custom_lib_dir/*' -prune -o -path 'tests/integration/namespace_*' -prune -o -path 'tests/integration/closure_actor_state_reject/*' -prune -o -path 'tests/integration/reserved_keyword_error/*' -prune -o -path 'tests/integration/ae_run_cflags/*' -prune -o -path 'tests/integration/bin_path_match/*' -prune -o -path 'tests/integration/bin_name_lookup_and_walkup/*' -prune -o -path 'tests/integration/string_plus_reject/*' -prune -o -path 'tests/integration/aether_string_to_c_extern/*' -prune -o -path 'tests/integration/module_extern_auto_unwrap/*' -prune -o -path 'tests/integration/http_external_ptr/*' -prune -o -path 'tests/integration/fs_read_binary_nul/*' -prune -o -path 'tests/integration/fs_write_binary_nul/*' -prune -o -path 'tests/integration/cryptography_sha/*' -prune -o -path 'tests/integration/cryptography_v2/*' -prune -o -path 'tests/integration/extern_annotation/*' -prune -o -path 'tests/integration/c_callback/*' -prune -o -path 'tests/integration/extern_tuple_return/*' -prune -o -path 'tests/integration/sqlite_roundtrip/*' -prune -o -path 'tests/integration/sqlite_prepared/*' -prune -o -path 'tests/integration/zlib_roundtrip/*' -prune -o -path 'tests/integration/aether_string_ffi_unwrap/*' -prune -o -path 'tests/integration/ptr_return_int_zero_inference/*' -prune -o -path 'tests/integration/string_interp_loop_alias/*' -prune -o -path 'tests/integration/transitive_module_import/*' -prune -o -path 'tests/integration/http_client_redirects/*' -prune -o -path 'tests/integration/source_location/*' -prune -o -path 'tests/integration/std_dl/*' -prune -o -path 'tests/integration/host_tinygo/*' -prune -o -path 'tests/integration/sealed_namespaces/*' -prune -o -path 'tests/integration/default_arguments/*' -prune -o -path 'tests/integration/source_location_default_capture/*' -prune -o -path 'tests/integration/fn_typed_local_call/*' -prune -o -path 'tests/integration/http_server_tls/*' -prune -o -path 'tests/integration/http_server_keepalive/*' -prune -o -path 'tests/integration/http_server_actor_dispatch/*' -prune -o -path 'tests/integration/http_middleware_d1/*' -prune -o -path 'tests/integration/http_middleware_d2/*' -prune -o -path 'tests/integration/http_server_ops/*' -prune -o -path 'tests/integration/http_server_observability/*' -prune -o -path 'tests/integration/http_server_sse/*' -prune -o -path 'tests/integration/http_server_websocket/*' -prune -o -name '*.ae' -print 2>/dev/null | sort | \
 	xargs -P $(NPROC) -I{} "$$script" "{}" "$$tmpdir" "$$root"; \
 	for sh_test in $$(find tests/integration -name 'test_*.sh' 2>/dev/null | sort); do \
 		name=$$(echo "$$sh_test" | sed 's|tests/||;s|/|_|g;s|\.sh$$||'); \
@@ -649,38 +655,51 @@ examples: compiler ae
 	@echo ===================================
 	@.\build\ae.exe examples
 else
-examples: compiler
+examples: compiler ae stdlib
 	@echo "==================================="
 	@echo "  Building Aether Examples"
+	@echo "  Parallel: $(NPROC) jobs"
 	@echo "==================================="
 	@$(MKDIR) $(BUILD_DIR)/examples $(BUILD_DIR)/examples/basics $(BUILD_DIR)/examples/actors $(BUILD_DIR)/examples/applications $(BUILD_DIR)/examples/c-interop $(BUILD_DIR)/examples/stdlib
-	@pass=0; fail=0; \
-	for src in $$(find examples -name '*.ae' | grep -v '/lib/' | grep -v '/packages/' | grep -v '/embedded-java/' | grep -v '/host-.*-demo\.ae$$' | sort); do \
-		name=$$(echo $$src | sed 's|examples/||;s|\.ae$$||'); \
-		dir=$$(dirname $$src); \
-		extra_c=""; \
-		if [ -d "$$dir" ]; then \
-			extra_c=$$(find "$$dir" -maxdepth 1 -name '*.c' 2>/dev/null | tr '\n' ' '); \
-		fi; \
-		printf "  %-30s " "$$name"; \
-		out_c="$(BUILD_DIR)/examples/$$name.c"; \
-		if ! ./build/aetherc$(EXE_EXT) $$src $$out_c 2>/tmp/ae_err.txt; then \
-			echo "FAIL (aetherc)"; \
-			cat /tmp/ae_err.txt 2>/dev/null | head -5; \
-			fail=$$((fail + 1)); \
-		elif ! $(CC) $(CFLAGS) $$out_c $$extra_c $(RUNTIME_SRC) $(STD_SRC) $(STD_REACTOR_SRC) $(COLLECTIONS_SRC) \
-		         -o $(BUILD_DIR)/examples/$$name$(EXE_EXT) $(LDFLAGS) 2>/tmp/cc_err.txt; then \
-			echo "FAIL (gcc)"; \
-			cat /tmp/cc_err.txt 2>/dev/null | head -20; \
-			fail=$$((fail + 1)); \
-		else \
-			echo "OK"; \
-			pass=$$((pass + 1)); \
-		fi; \
-	done; \
+	@tmpdir=$$(mktemp -d); \
+	script="$$tmpdir/build_one.sh"; \
+	printf '#!/bin/sh\n'                                                                            > "$$script"; \
+	printf 'src="$$1"; tmpdir="$$2"; root="$$3"\n'                                                  >> "$$script"; \
+	printf 'name=$$(echo "$$src" | sed "s|examples/||;s|\\.ae$$||")\n'                              >> "$$script"; \
+	printf 'key=$$(echo "$$name" | sed "s|/|_|g")\n'                                                >> "$$script"; \
+	printf 'dir=$$(dirname "$$src")\n'                                                              >> "$$script"; \
+	printf 'extra_c=""\n'                                                                           >> "$$script"; \
+	printf 'if [ -d "$$dir" ]; then\n'                                                              >> "$$script"; \
+	printf '  extra_c=$$(find "$$dir" -maxdepth 1 -name "*.c" 2>/dev/null | tr "\\n" " ")\n'        >> "$$script"; \
+	printf 'fi\n'                                                                                   >> "$$script"; \
+	printf 'out_c="$$root/$(BUILD_DIR)/examples/$$name.c"\n'                                        >> "$$script"; \
+	printf 'mkdir -p "$$(dirname "$$out_c")"\n'                                                     >> "$$script"; \
+	printf 'if ! "$$root/build/aetherc$(EXE_EXT)" "$$src" "$$out_c" 2>"$$tmpdir/$$key.aetherc.err"; then\n' >> "$$script"; \
+	printf '  printf "  %%-30s %%s\\n" "$$name" "FAIL (aetherc)"\n'                                 >> "$$script"; \
+	printf '  head -5 "$$tmpdir/$$key.aetherc.err"\n'                                               >> "$$script"; \
+	printf '  touch "$$tmpdir/FAIL_$$key"\n'                                                        >> "$$script"; \
+	printf '  exit 1\n'                                                                             >> "$$script"; \
+	printf 'fi\n'                                                                                   >> "$$script"; \
+	printf 'if ! $(CC) $(CFLAGS) "$$out_c" $$extra_c "$$root/$(BUILD_DIR)/libaether.a" -o "$$root/$(BUILD_DIR)/examples/$$name$(EXE_EXT)" $(LDFLAGS) 2>"$$tmpdir/$$key.gcc.err"; then\n' >> "$$script"; \
+	printf '  printf "  %%-30s %%s\\n" "$$name" "FAIL (gcc)"\n'                                     >> "$$script"; \
+	printf '  head -20 "$$tmpdir/$$key.gcc.err"\n'                                                  >> "$$script"; \
+	printf '  touch "$$tmpdir/FAIL_$$key"\n'                                                        >> "$$script"; \
+	printf '  exit 1\n'                                                                             >> "$$script"; \
+	printf 'fi\n'                                                                                   >> "$$script"; \
+	printf 'printf "  %%-30s %%s\\n" "$$name" "OK"\n'                                               >> "$$script"; \
+	printf 'touch "$$tmpdir/PASS_$$key"\n'                                                          >> "$$script"; \
+	chmod +x "$$script"; \
+	root=$$(pwd); \
+	find examples -name '*.ae' \
+	    | grep -v '/lib/' | grep -v '/packages/' | grep -v '/embedded-java/' | grep -v '/host-.*-demo\.ae$$' \
+	    | sort \
+	    | xargs -P $(NPROC) -I{} "$$script" "{}" "$$tmpdir" "$$root"; \
+	pass=$$(ls "$$tmpdir"/PASS_* 2>/dev/null | wc -l | tr -d ' '); \
+	fail=$$(ls "$$tmpdir"/FAIL_* 2>/dev/null | wc -l | tr -d ' '); \
 	echo ""; \
 	echo "  $$pass passed, $$fail failed"; \
 	echo "  Binaries in $(BUILD_DIR)/examples/"; \
+	rm -rf "$$tmpdir"; \
 	if [ "$$fail" -gt 0 ]; then exit 1; fi
 endif
 
@@ -696,11 +715,11 @@ examples-run: examples
 		echo ""; \
 	done
 
-lsp: compiler
+lsp: compiler stdlib
 	@echo "==================================="
 	@echo "Building Aether LSP Server ($(DETECTED_OS))"
 	@echo "==================================="
-	$(CC) $(CFLAGS) lsp/main.c lsp/aether_lsp.c $(COMPILER_LIB_SRC) $(RUNTIME_SRC) $(STD_SRC) $(STD_REACTOR_SRC) $(LDFLAGS) -Icompiler -Istd -o build/aether-lsp$(EXE_EXT)
+	$(CC) $(CFLAGS) lsp/main.c lsp/aether_lsp.c build/libaether_compiler.a build/libaether.a -Icompiler -Istd -Istd/collections -o build/aether-lsp$(EXE_EXT) $(LDFLAGS)
 	@echo "✓ LSP Server built successfully: build/aether-lsp$(EXE_EXT)"
 
 apkg:
@@ -767,8 +786,8 @@ docs-serve: docs docs-server
 	@echo ""
 	./build/docs-server$(EXE_EXT)
 
-# Precompiled stdlib archive
-stdlib: $(STD_OBJS) $(STD_REACTOR_OBJS) $(COLLECTIONS_OBJS) $(RUNTIME_OBJS)
+# Precompiled stdlib archive — runtime + std for user programs.
+stdlib: $(STD_OBJS) $(STD_REACTOR_OBJS) $(COLLECTIONS_OBJS) $(RUNTIME_OBJS) build/libaether_compiler.a
 	@echo "Creating precompiled stdlib archive..."
 	@ar rcs build/libaether.a $(STD_OBJS) $(STD_REACTOR_OBJS) $(COLLECTIONS_OBJS) $(RUNTIME_OBJS)
 	@echo "✓ Stdlib archive created: build/libaether.a"
@@ -777,6 +796,102 @@ ifeq ($(shell uname -s),Linux)
 	@$(CC) -shared -fPIC -o build/libaether_sandbox.so runtime/libaether_sandbox_preload.c -ldl -lrt 2>/dev/null || true
 	@test -f build/libaether_sandbox.so && echo "✓ Sandbox preload: build/libaether_sandbox.so" || true
 endif
+
+# Compiler-as-library archive — COMPILER_LIB_SRC without aetherc.c's main().
+# Consumed by the LSP server and the sanitizer test runners. Kept separate
+# from libaether.a because user programs never need the compiler embedded.
+build/libaether_compiler.a: $(COMPILER_LIB_OBJS)
+	@echo "Creating compiler-as-library archive..."
+	@ar rcs $@ $(COMPILER_LIB_OBJS)
+	@echo "✓ Compiler-lib archive created: $@"
+
+# Sanitizer / debug-flavoured archives.
+#
+# AddressSanitizer instrumentation only catches issues in code it touches
+# at compile time — running asan-instrumented test code against an
+# uninstrumented stdlib leaves any leak/UB in std/* invisible.
+# Same logic for AETHER_MEMORY_TRACKING (the macro adds counters inside
+# aether_memory.c that need to be defined when stdlib code calls into it)
+# and for the -O0 -g shape that valgrind needs for legible traces.
+#
+# Building flavoured archives once per flavour lets each test runner
+# link instantly while preserving full coverage. Pattern rules emit to
+# `build/<flavour>-obj/...` so the default obj/ tree is untouched.
+
+CFLAGS_NO_OPT := $(filter-out -O3 -O2 -O1 -O0,$(CFLAGS))
+# Apple Clang on arm64 doesn't accept -fsanitize=leak (LeakSanitizer is
+# bundled into ASan at runtime on Darwin). On Linux gcc/clang it must be
+# requested explicitly. Platform-detect to keep both green.
+ifeq ($(shell uname -s),Linux)
+ASAN_FLAGS    := -fsanitize=address -fsanitize=leak -fno-omit-frame-pointer
+else
+ASAN_FLAGS    := -fsanitize=address -fno-omit-frame-pointer
+endif
+ASAN_OPT      := -O1 -g
+MEM_FLAGS     := -DAETHER_MEMORY_TRACKING
+DBG_OPT       := -O0 -g
+
+ASAN_OBJ_DIR := build/asan-obj
+MEM_OBJ_DIR  := build/memory-obj
+DBG_OBJ_DIR  := build/dbg-obj
+
+ASAN_LIB_OBJS = $(STD_SRC:%.c=$(ASAN_OBJ_DIR)/%.o) \
+                $(STD_REACTOR_SRC:%.c=$(ASAN_OBJ_DIR)/%.o) \
+                $(COLLECTIONS_SRC:%.c=$(ASAN_OBJ_DIR)/%.o) \
+                $(RUNTIME_SRC:%.c=$(ASAN_OBJ_DIR)/%.o)
+ASAN_COMPILER_LIB_OBJS = $(COMPILER_LIB_SRC:%.c=$(ASAN_OBJ_DIR)/%.o)
+
+MEM_LIB_OBJS = $(STD_SRC:%.c=$(MEM_OBJ_DIR)/%.o) \
+               $(STD_REACTOR_SRC:%.c=$(MEM_OBJ_DIR)/%.o) \
+               $(COLLECTIONS_SRC:%.c=$(MEM_OBJ_DIR)/%.o) \
+               $(RUNTIME_SRC:%.c=$(MEM_OBJ_DIR)/%.o)
+MEM_COMPILER_LIB_OBJS = $(COMPILER_LIB_SRC:%.c=$(MEM_OBJ_DIR)/%.o)
+
+DBG_LIB_OBJS = $(STD_SRC:%.c=$(DBG_OBJ_DIR)/%.o) \
+               $(STD_REACTOR_SRC:%.c=$(DBG_OBJ_DIR)/%.o) \
+               $(COLLECTIONS_SRC:%.c=$(DBG_OBJ_DIR)/%.o) \
+               $(RUNTIME_SRC:%.c=$(DBG_OBJ_DIR)/%.o)
+DBG_COMPILER_LIB_OBJS = $(COMPILER_LIB_SRC:%.c=$(DBG_OBJ_DIR)/%.o)
+
+$(ASAN_OBJ_DIR)/%.o: %.c
+	@mkdir -p $(dir $@)
+	@$(CC) $(CFLAGS_NO_OPT) $(ASAN_OPT) $(ASAN_FLAGS) -c $< -o $@
+
+$(MEM_OBJ_DIR)/%.o: %.c
+	@mkdir -p $(dir $@)
+	@$(CC) $(CFLAGS) $(MEM_FLAGS) -c $< -o $@
+
+$(DBG_OBJ_DIR)/%.o: %.c
+	@mkdir -p $(dir $@)
+	@$(CC) $(CFLAGS_NO_OPT) $(DBG_OPT) -c $< -o $@
+
+build/asan/libaether.a: $(ASAN_LIB_OBJS)
+	@mkdir -p build/asan
+	@ar rcs $@ $(ASAN_LIB_OBJS)
+
+build/asan/libaether_compiler.a: $(ASAN_COMPILER_LIB_OBJS)
+	@mkdir -p build/asan
+	@ar rcs $@ $(ASAN_COMPILER_LIB_OBJS)
+
+build/memory/libaether.a: $(MEM_LIB_OBJS)
+	@mkdir -p build/memory
+	@ar rcs $@ $(MEM_LIB_OBJS)
+
+build/memory/libaether_compiler.a: $(MEM_COMPILER_LIB_OBJS)
+	@mkdir -p build/memory
+	@ar rcs $@ $(MEM_COMPILER_LIB_OBJS)
+
+build/dbg/libaether.a: $(DBG_LIB_OBJS)
+	@mkdir -p build/dbg
+	@ar rcs $@ $(DBG_LIB_OBJS)
+
+build/dbg/libaether_compiler.a: $(DBG_COMPILER_LIB_OBJS)
+	@mkdir -p build/dbg
+	@ar rcs $@ $(DBG_COMPILER_LIB_OBJS)
+
+stdlib-asan: build/asan/libaether.a build/asan/libaether_compiler.a
+stdlib-memory: build/memory/libaether.a build/memory/libaether_compiler.a
+stdlib-dbg: build/dbg/libaether.a build/dbg/libaether_compiler.a
 
 # Self-test: compiler on itself
 self-test: compiler
@@ -1411,7 +1526,7 @@ asan-check: clean
 	  fi
 	@echo "✓ ASan clean — no memory errors detected"
 
-.PHONY: all compiler lsp apkg ae profiler docgen docs-server docs docs-serve test test-build test-valgrind test-asan test-memory test-manual-runtime test-install test-release-archive benchmark benchmark-ui examples run compile repl clean help self-test install stats stdlib ci ci-windows docker-ci docker-ci-windows docker-build-ci valgrind-check asan-check ci-coop ci-wasm ci-embedded ci-portability docker-ci-wasm docker-ci-embedded contrib-host-check contrib-aether-ui-check benchmark-aether-ui
+.PHONY: all compiler lsp apkg ae profiler docgen docs-server docs docs-serve test test-build test-valgrind test-asan test-memory test-manual-runtime test-install test-release-archive benchmark benchmark-ui examples run compile repl clean help self-test install stats stdlib stdlib-asan stdlib-memory stdlib-dbg ci ci-windows docker-ci docker-ci-windows docker-build-ci valgrind-check asan-check ci-coop ci-wasm ci-embedded ci-portability docker-ci-wasm docker-ci-embedded contrib-host-check contrib-aether-ui-check benchmark-aether-ui
 
 # Cross-language benchmark UI (alias for benchmark)
 benchmark-ui: benchmark

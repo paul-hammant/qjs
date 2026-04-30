@@ -85,6 +85,12 @@ typedef enum {
     AST_STRUCT_LITERAL,
     AST_STRING_INTERP,      // interpolated string "Hello ${expr}"
     AST_NULL_LITERAL,       // null pointer literal
+    AST_PTR_AS_STRUCT_CAST, // `expr as *StructName` — view a raw ptr as
+                            // a pointer-to-struct. children[0] = expr
+                            // (must be ptr-typed); value = struct name.
+                            // Result type is TYPE_PTR with element_type
+                            // = TYPE_STRUCT{name}; member-access codegen
+                            // emits `->field` not `.field`.
     AST_IF_EXPRESSION,      // if cond { expr } else { expr } — value-producing
 
     // Closures
@@ -109,7 +115,10 @@ typedef enum {
     TYPE_UINT64,
     TYPE_FLOAT,
     TYPE_BOOL,
-    TYPE_BYTE,
+    TYPE_BYTE,          // unsigned 8-bit (`unsigned char` in C). Type-precision
+                        // for struct fields, function params, returns, locals.
+                        // For bulk byte storage, use std.bytes (the mutable
+                        // buffer) — `byte` is the single-octet primitive only.
     TYPE_STRING,
     TYPE_ACTOR_REF,
     TYPE_MESSAGE,
@@ -163,6 +172,18 @@ void free_type(Type* type);
 const char* type_to_string(Type* type);
 int types_equal(Type* a, Type* b);
 Type* clone_type(Type* type);
+
+/* True when `t` is a typed pointer to the cons-cell `StringSeq`
+ * runtime struct (see std/collections/aether_stringseq.h) — i.e.
+ * Aether-side `*StringSeq`. Used by typechecker + codegen to
+ * dispatch on cons-cell-typed match expressions, literal targets,
+ * and field types. Centralised here so the struct-name literal
+ * lives in exactly one place. */
+int is_string_seq_ptr_type(const Type* t);
+
+/* Build a fresh `*StringSeq` Type. Caller owns and must `free_type`
+ * it. */
+Type* make_string_seq_ptr_type(void);
 
 // AST Node functions
 ASTNode* create_ast_node(ASTNodeType type, const char* value, int line, int column);

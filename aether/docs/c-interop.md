@@ -52,7 +52,10 @@ extern void_function(param: type)  // No return type = void
 | `float` | `double` |
 | `string` | `const char*` |
 | `bool` | `int` |
+| `byte` | `unsigned char` |
 | `ptr` | `void*` |
+
+> **`byte` mapping note.** `byte` lowers to `unsigned char`, not `uint8_t`. The two are typedef-compatible on every platform Aether targets, but C's strict-aliasing rules give `unsigned char *` an exemption (it can legally alias any type's bytes for read/write); `uint8_t *` does not. Since `byte` is exactly the type used in C extern signatures that scrape bytes from other types' storage (packed binary protocol parsers, NaN-boxing tag readers, on-disk file headers), `unsigned char` is the right choice.
 
 ### Example: Custom C Functions
 
@@ -462,6 +465,87 @@ int shim(const char* s, int len) {
 ```
 
 If a shim genuinely needs to dispatch on the header (e.g. for a polymorphic API where the caller might pass either a literal or a wrapped string and the length isn't known to the caller), declare its parameter as `ptr` to opt out of auto-unwrap, and dispatch via `aether_string_data` / `aether_string_length` manually.
+
+**The same hazard fires inside Aether code.** Any Aether library that exports a `string`-typed parameter and tries to derive length / slice / iterate is at risk for the symmetric reason: the auto-unwrap fires at the `.ae→.ae` extern boundary, replacing the length-aware AetherString with a raw payload pointer. By the time the helper sees its argument, calls to `string.length(s)`, `string.substring(s, …)`, or `string.char_at(s, i)` go through `str_len` → `strlen` and truncate binary content at the first embedded NUL.
+
+```aether
+// HAZARD — looks safe; truncates binary content at the auto-unwrap.
+export slice_from(s: string, start: int, end: int) -> string {
+    n = string.length(s)        // strlen on auto-unwrapped payload!
+    if end > n { end = n }      // clamps to first-NUL-prefix length
+    return string.substring(s, start, end)
+}
+```
+
+For Aether libraries operating on potentially-binary input, use the explicit-length companions in `std.string`:
+
+```aether
+// CORRECT — caller threads the length through; no internal strlen.
+export slice_from(s: string, s_len: int, start: int, end: int) -> string {
+    n = string.length_n(s, s_len)   // identity; documents intent
+    if end > n { end = n }
+    return string.substring_n(s, s_len, start, end)
+}
+```
+
+`string.substring_n(s, s_len, start, end)` and `string.length_n(s, s_known)` exist specifically to make this pattern available without falling back to a C shim. If you find yourself accumulating `_n`-suffixed externs (`some_op_n`, `some_op_n_n`) at the FFI boundary, that's a sign the function should accept the length as a regular parameter on the Aether side too — not punt to C.
+
+### Struct overlay on raw pointers — `*StructName` and `expr as *StructName`
+
+Systems-programming code often needs to overlay a struct header on a raw `ptr`: a linked-list node whose `next` field lives at offset 8 of a malloc'd block, a tagged-pointer JSValue, an arena-allocator chunk header, etc. Writing a parallel API of width-typed intrinsics (`ptr_set_int`, `ptr_set_ptr`, `ptr_set_long`, …) for every field width is the wrong shape — it doesn't generalise to mixed-field structs and locks the language into an opaque-pointer style that's harder to read than C itself.
+
+Aether's answer is a first-class **pointer-to-struct type** spelled `*StructName`, plus an `as` cast operator that produces a value of that type from a raw `ptr`. The pointer-ness is part of the spelled type so callers can declare it on parameters, returns, struct fields, and locals:
+
+```aether
+extern malloc(size: int) -> ptr
+extern free(p: ptr)
+
+struct ListHead {
+    next: ptr
+    prev: ptr
+    flags: int
+}
+
+// `*ListHead` is a first-class type. Functions can declare it on
+// parameters, returns, locals, and struct fields.
+init_head(h: *ListHead) {
+    h.next  = 0
+    h.prev  = 0
+    h.flags = 1
+}
+
+main() {
+    raw  = malloc(64)
+    head = raw as *ListHead    // `head` has type *ListHead
+    init_head(head)
+    free(raw)
+}
+```
+
+`*ListHead` lowers to `ListHead*` in the generated C; the cast `raw as *ListHead` lowers to `((ListHead*)(raw))`. Member access on a `*StructName`-typed value emits `view->field` (not `view.field`), matching the C convention.
+
+**Semantics**
+
+- The operand of `as` must be a `ptr` value (or `int` / `int64`, since Aether already coerces ptr-shaped integers to and from `ptr`). A struct value, string, or other type produces a typecheck error.
+- The named struct must be defined and visible at the cast site. Unknown struct names produce a typecheck error.
+- The cast itself is a view — **it does not allocate, refcount, or auto-free**. The operand pointer's lifetime is the caller's problem (the same contract as raw `extern` interaction). If the underlying memory is freed while a struct view still references it, you have a use-after-free; Aether does not track this.
+- Two views of the same memory alias each other (writes through one are visible through the other). This is the whole point.
+- A `ptr`-typed field of a struct view can itself be re-cast: `head.next as *ListHead` reaches the next list element.
+- `*StructName` is accepted in any type position: variable annotations, function parameters, function return types, struct fields, extern declarations.
+
+**When to reach for it**
+
+- Porting C data structures (linked lists, intrusive trees, ring buffers) where the storage was allocated by C and Aether wants to manipulate fields.
+- Implementing tagged-pointer / NaN-boxing / pointer-bit-flag schemes for embedded interpreters.
+- Reading on-disk file headers or wire-protocol frames where you've `read()` raw bytes into a buffer and want to reach individual fields.
+
+**When NOT to reach for it**
+
+- For Aether-owned data that participates in the language's normal value semantics, declare a struct and use struct-literal construction (`Point { x: 1, y: 2 }`) — that path runs constructors / refcounting / lifetime tracking. The `*T` cast is specifically the unsafe-by-design escape hatch for crossing into raw memory; reaching for it on Aether-owned data sidesteps the safety machinery for no benefit.
+
+**Token-sharing with `import x as y`**
+
+The `as` keyword is the same token already used for module-import aliasing (`import std.cryptography as crypto`). The two parses don't collide because import-aliasing is recognised only inside `import` statements; expression-level `as *T` is recognised only as a postfix operator on expressions. Both forms continue to work in the same source file.
 
 ### Aether-side string-builder return types
 
