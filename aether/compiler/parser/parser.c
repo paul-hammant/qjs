@@ -491,7 +491,13 @@ ASTNode* parse_primary_expression(Parser* parser) {
         case TOKEN_STRING_LITERAL:
         case TOKEN_TRUE:
         case TOKEN_FALSE:
-            return create_literal_node(advance_token(parser));
+            {
+            Token* t = advance_token(parser);
+            if (t->type == TOKEN_INT64_LITERAL) {
+                return create_ast_node(AST_LONG_LITERAL, t->value, t->line, t->column);
+            }
+            return create_literal_node(t);
+        }
 
         case TOKEN_NULL: {
             Token* t = advance_token(parser);
@@ -917,6 +923,30 @@ static ASTNode* parse_postfix_expression(Parser* parser) {
             continue;
         }
         
+        if (op->type == TOKEN_AS) {
+            advance_token(parser);
+            Token* next = peek_token(parser);
+            if (next && next->type == TOKEN_MULTIPLY) {
+                advance_token(parser);
+                Token* s = expect_token(parser, TOKEN_IDENTIFIER);
+                if (!s) return NULL;
+                ASTNode* cast = create_ast_node(AST_PTR_AS_STRUCT_CAST, s->value, op->line, op->column);
+                add_child(cast, expr);
+                expr = cast;
+            } else if (next) {
+                const char* target = "int64_t";
+                if (next->type == TOKEN_INT) target = "int";
+                else if (next->type == TOKEN_INT64) target = "int64_t";
+                else if (next->type == TOKEN_PTR) target = "void*";
+                else if (next->type == TOKEN_IDENTIFIER) target = next->value;
+                advance_token(parser);
+                ASTNode* cast = create_ast_node(AST_CAST, target, op->line, op->column);
+                add_child(cast, expr);
+                expr = cast;
+            }
+            continue;
+        }
+
         if (op->type == TOKEN_LEFT_PAREN) {
             // Function call: expr(arg1, arg2, ...)
             // Extract function name - handle both simple and namespaced calls

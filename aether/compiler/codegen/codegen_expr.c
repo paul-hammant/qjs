@@ -1418,6 +1418,14 @@ void generate_expression(CodeGenerator* gen, ASTNode* expr) {
     if (!expr) return;
     
     switch (expr->type) {
+        case AST_CAST:
+            fprintf(gen->output, "("); fprintf(gen->output, "%s", expr->value); fprintf(gen->output, ")");
+            generate_expression(gen, expr->children[0]);
+            break;
+        case AST_LONG_LITERAL:
+            fprintf(gen->output, "(int64_t)");
+            fprintf(gen->output, "%s", expr->value);
+            break;
         case AST_LITERAL:
             if (expr->node_type && expr->node_type->kind == TYPE_STRING) {
                 fprintf(gen->output, "\"");

@@ -1,0 +1,87 @@
+/* MicroQuickJS Core - Aether Implementation */
+import std.string
+import std.io
+
+struct JSContext { heap_base: ptr, heap_free: ptr, stack_top: ptr, sp: ptr, stack_bottom: ptr, fp: ptr, min_free_size: int, random_state: int, current_exception: long, empty_props: long, atom_table: ptr, atom_count: int, top_gc_ref: ptr, last_gc_ref: ptr, class_count: int }
+struct JSObject { header: long, proto: long, props: long }
+struct BoxLong { v: long }
+struct ByteBox { b: byte }
+struct JSMemBlockHeader { header: long }
+struct JSValueArray { header: long, size: int }
+struct JSSTDLibraryDef { class_count: int }
+
+@extern("memset") _memset(p: ptr, v: int, n: int) -> ptr
+@extern("memcpy") _memcpy(dst: ptr, src: ptr, n: int) -> ptr
+@extern("string_length") s_len(s: string) -> int
+
+@extern("JS_IsInt") JS_IsInt(v: long) -> int
+@extern("JS_IsPtr") JS_IsPtr(v: long) -> int
+@extern("JS_VALUE_TO_PTR") JS_VAL_TO_PTR(v: long) -> ptr
+@extern("JS_VALUE_FROM_PTR") JS_VAL_FROM_PTR(p: ptr) -> long
+@extern("JS_VALUE_MAKE_INT") JS_VALUE_MAKE_INT(i: int) -> long
+@extern("ptr_add_long") ptr_add_long(p: ptr, offset: long) -> ptr
+
+js_malloc(ctx_p: ptr, sz: int, mt: int) -> ptr {
+    var ctx = ctx_p as *JSContext;
+    var aligned = ((sz + 7) & (0 - 8));
+    var p = ctx.heap_free;
+    var off = aligned as long;
+    ctx.heap_free = ptr_add_long(p, off);
+    var h = p as *JSMemBlockHeader;
+    h.header = (mt as long) << 1;
+    return p;
+}
+
+js_alloc_value_array(ctx_p: ptr, sz: int) -> ptr {
+    var total = 16 + (sz * 8);
+    var p = js_malloc(ctx_p, total, 4);
+    var va = p as *JSValueArray;
+    va.size = sz;
+    var i = 0;
+    while (i < sz) {
+        var off = 16L + (i as long * 8L);
+        var box = ptr_add_long(p, off) as *BoxLong;
+        box.v = 1L;
+        i = i + 1;
+    }
+    return p;
+}
+
+JS_NewContext2(m_p: ptr, sz: int, d_p: ptr, dummy: int) -> ptr {
+    var def = d_p as *JSSTDLibraryDef;
+    var ctx = m_p as *JSContext;
+    _memset(m_p, 0, 256);
+    ctx.class_count = def.class_count;
+    var cl_c = ctx.class_count as long;
+    var heap_off = 256L + (16L * cl_c);
+    ctx.heap_base = ptr_add_long(m_p, heap_off);
+    ctx.heap_free = ctx.heap_base;
+    var st_off = (sz & (0 - 8)) as long;
+    ctx.stack_top = ptr_add_long(m_p, st_off);
+    ctx.sp = ctx.stack_top;
+    ctx.stack_bottom = ctx.sp;
+    ctx.empty_props = JS_VAL_FROM_PTR(js_alloc_value_array(m_p, 0));
+    return m_p;
+}
+
+JS_NewObject(ctx_p: ptr) -> long {
+    var p = js_malloc(ctx_p, 24, 1);
+    var obj = p as *JSObject;
+    obj.header = 2L;
+    obj.proto = 2L;
+    var ctx = ctx_p as *JSContext;
+    obj.props = ctx.empty_props;
+    return JS_VAL_FROM_PTR(p);
+}
+
+JS_NewString(ctx_p: ptr, s: string) -> long {
+    var len = s_len(s);
+    var p = js_malloc(ctx_p, 8 + len + 1, 2);
+    var mb = p as *JSMemBlockHeader;
+    var len_l = len as long;
+    mb.header = 4L | (len_l << 7);
+    _memcpy(ptr_add_long(p, 8L), s as ptr, len);
+    var term = ptr_add_long(p, 8L + len_l) as *ByteBox;
+    term.b = 0 as byte;
+    return JS_VAL_FROM_PTR(p);
+}

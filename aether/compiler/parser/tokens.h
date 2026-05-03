@@ -67,6 +67,7 @@ typedef enum {
     // Literals
     TOKEN_IDENTIFIER,
     TOKEN_NUMBER,
+    TOKEN_INT64_LITERAL,
     TOKEN_STRING_LITERAL,
     TOKEN_INTERP_STRING,    // string literal containing ${expr} interpolation
     TOKEN_TRUE,

@@ -271,7 +271,12 @@ Token* read_number() {
     }
 
     buffer[i] = '\0';
-    Token* token = create_token(TOKEN_NUMBER, buffer, current_line, current_column);
+    AeTokenType type = TOKEN_NUMBER;
+    if (peek() == 'L') {
+        advance();
+        type = TOKEN_INT64_LITERAL;
+    }
+    Token* token = create_token(type, buffer, current_line, current_column);
     free(buffer);
     return token;
 }
@@ -684,6 +689,7 @@ const char* token_type_to_string(AeTokenType type) {
         case TOKEN_MESSAGE: return "MESSAGE";
         case TOKEN_IDENTIFIER: return "IDENTIFIER";
         case TOKEN_NUMBER: return "NUMBER";
+        case TOKEN_INT64_LITERAL: return "INT64_LITERAL";
         case TOKEN_STRING_LITERAL: return "STRING_LITERAL";
         case TOKEN_TRUE: return "TRUE";
         case TOKEN_FALSE: return "FALSE";

@@ -820,6 +820,16 @@ Type* infer_type(ASTNode* expr, SymbolTable* table) {
             return result;
         }
 
+        case AST_CAST: {
+            if (strcmp(expr->value, "int") == 0) return create_type(TYPE_INT);
+            if (strcmp(expr->value, "int64_t") == 0) return create_type(TYPE_INT64);
+            if (strcmp(expr->value, "void*") == 0) return create_type(TYPE_PTR);
+            return create_type(TYPE_UNKNOWN);
+        }
+
+        case AST_LONG_LITERAL:
+            return create_type(TYPE_INT64);
+
         case AST_IF_EXPRESSION:
             // Type is the type of the then-branch expression
             if (expr->child_count >= 2) {
@@ -1056,6 +1066,9 @@ Type* infer_binary_type(ASTNode* left, ASTNode* right, AeTokenType operator) {
         case TOKEN_CARET:
         case TOKEN_LSHIFT:
         case TOKEN_RSHIFT:
+            if (left_type->kind == TYPE_INT64 || right_type->kind == TYPE_INT64) {
+                return create_type(TYPE_INT64);
+            }
             // Bitwise operations: integer operands, result matches wider type
             if (left_type->kind == TYPE_UNKNOWN || right_type->kind == TYPE_UNKNOWN) {
                 return create_type(TYPE_UNKNOWN);
@@ -2798,22 +2811,24 @@ int typecheck_expression(ASTNode* expr, SymbolTable* table) {
             }
             return 1;
 
-        case AST_NULL_LITERAL:
-            // null is always TYPE_PTR
-            if (!expr->node_type) expr->node_type = create_type(TYPE_PTR);
-            return 1;
-
+        case AST_CAST:
         case AST_PTR_AS_STRUCT_CAST:
-            /* Walk the operand, then set our own node_type via the
-             * shared inference path so codegen sees the
-             * TYPE_PTR{element=TYPE_STRUCT} on this node and emits
-             * `->field` for downstream member access. */
             if (expr->child_count > 0) {
                 typecheck_expression(expr->children[0], table);
             }
             if (expr->node_type) free_type(expr->node_type);
             expr->node_type = infer_type(expr, table);
             return 1;
+
+        case AST_LONG_LITERAL:
+            if (!expr->node_type) expr->node_type = create_type(TYPE_INT64);
+            return 1;
+
+        case AST_NULL_LITERAL:
+            // null is always TYPE_PTR
+            if (!expr->node_type) expr->node_type = create_type(TYPE_PTR);
+            return 1;
+
 
         case AST_ARRAY_LITERAL:
             // Type check all array elements
