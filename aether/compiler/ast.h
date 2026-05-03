@@ -91,7 +91,9 @@ typedef enum {
                             // Result type is TYPE_PTR with element_type
                             // = TYPE_STRUCT{name}; member-access codegen
                             // emits `->field` not `.field`.
-    AST_IF_EXPRESSION,      // if cond { expr } else { expr } — value-producing
+    AST_IF_EXPRESSION,
+    AST_LONG_LITERAL,
+    AST_CAST,      // if cond { expr } else { expr } — value-producing
 
     // Closures
     AST_CLOSURE,            // |params| -> expr  OR  |params| { block }

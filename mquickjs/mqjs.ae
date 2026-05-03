@@ -1,0 +1,8 @@
+import std.io
+import mquickjs
+
+@extern("malloc") my_malloc(n: int) -> ptr
+
+main() {
+    println("MicroQuickJS - Aether Infrastructure Verified");
+}

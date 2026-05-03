@@ -1,26 +1,14 @@
-/* list.ae - Doubly linked list for Aether port */
-
-struct list_head {
-    next: ptr,
-    prev: ptr
+struct list_head { next: ptr, prev: ptr }
+exports (list_head, list_init, list_add, list_del, list_is_empty)
+list_init(el: ptr) { var h = el as *list_head; h.next = el; h.prev = el; }
+list_add(el: ptr, head: ptr) {
+    var h = head as *list_head; var e = el as *list_head;
+    var next = h.next; var next_h = next as *list_head;
+    e.next = next; e.prev = head; next_h.prev = el; h.next = el;
 }
-
-// In Aether, we can't easily do el->next = el because ptr indexing
-// is byte-based. We'd need something like:
-// func list_init(el: ptr) {
-//     let head = el as list_head; // If Aether supported pointer casting to structs
-//     head.next = el;
-//     head.prev = el;
-// }
-
-func list_init(el: ptr) {
-    // Placeholder for when Aether supports struct-over-pointer casting
+list_del(el: ptr) {
+    var e = el as *list_head; var prev = e.prev; var next = e.next;
+    var prev_h = prev as *list_head; var next_h = next as *list_head;
+    prev_h.next = next; next_h.prev = prev; e.next = null; e.prev = null;
 }
-
-func list_add(new_el: ptr, head: ptr) {
-    // Implementation pending pointer-to-struct casting
-}
-
-func list_empty(head: ptr) : bool {
-    return false
-}
+list_is_empty(el: ptr) -> int { var h = el as *list_head; if (h.next == el) { return 1; } return 0; }
